@@ -198,8 +198,10 @@ export async function hydrateDb(): Promise<DatabaseSchema> {
 
   try {
     const res = await fetch(`${kv.url}/get/${encodeURIComponent(REMOTE_KV_KEY)}`, {
-      headers: { Authorization: `Bearer ${kv.token}` },
-      cache: 'no-store',
+      headers: {
+        Authorization: `Bearer ${kv.token}`,
+        'Cache-Control': 'no-store',
+      },
     });
     if (res.ok) {
       const json = (await res.json()) as { result?: string | null };

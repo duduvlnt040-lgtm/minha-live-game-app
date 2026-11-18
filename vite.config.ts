@@ -38,6 +38,15 @@ export default defineConfig(() => {
               fs.copyFileSync(srcAbs, path.join(distVendor, destName));
             }
           }
+          const indexHtml = path.join(distDir, 'index.html');
+          if (fs.existsSync(indexHtml)) {
+            const spaRoutes = ['login', 'cadastro', 'recuperar-senha', 'redefinir-senha', 'dashboard', 'admin'];
+            for (const route of spaRoutes) {
+              const routeDir = path.join(distDir, route);
+              fs.mkdirSync(routeDir, {recursive: true});
+              fs.copyFileSync(indexHtml, path.join(routeDir, 'index.html'));
+            }
+          }
         },
       },
     ],

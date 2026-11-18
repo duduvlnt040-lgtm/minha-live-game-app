@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <rect width="64" height="64" rx="14" fill="#0B0D14"/>
+  <rect x="2" y="2" width="60" height="60" rx="12" stroke="url(#mlg_border)" stroke-width="2"/>
+  <path d="M18 44V20L32 33L46 20V44" stroke="url(#mlg_stroke)" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M27 44L32 39L37 44" stroke="#06B6D4" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <defs>
+    <linearGradient id="mlg_border" x1="2" y1="2" x2="62" y2="62" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8B5CF6"/>
+      <stop offset="0.5" stop-color="#3B82F6"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="mlg_stroke" x1="18" y1="20" x2="46" y2="44" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A78BFA"/>
+      <stop offset="0.5" stop-color="#3B82F6"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+  </defs>
+</svg>

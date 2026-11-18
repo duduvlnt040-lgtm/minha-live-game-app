@@ -1,0 +1,6 @@
+{
+  "name": "MINHA LIVE GAMES",
+  "description": "Plataforma profissional de jogos interativos, overlays em tempo real e automação de eventos para transmissões ao vivo no TikTok LIVE e OBS.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

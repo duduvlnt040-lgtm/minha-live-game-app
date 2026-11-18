@@ -1,4 +1,4 @@
-import type { EventRule, LiveEventPayload } from '../types/platform';
+import type { EventRule, LiveEventPayload } from '../types/platform.js';
 
 export interface RuleInputEvent {
   gameId: string;

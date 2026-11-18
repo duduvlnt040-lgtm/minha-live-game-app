@@ -12,7 +12,7 @@ import type {
   UserProfile,
   UserRole,
   UserSettings,
-} from '../src/types/platform';
+} from '../src/types/platform.js';
 
 export interface StoredUser extends UserProfile {
   passwordHash: string;

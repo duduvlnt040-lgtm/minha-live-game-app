@@ -1,4 +1,4 @@
-import type { PlanTier } from '../types/platform';
+import type { PlanTier } from '../types/platform.js';
 
 export interface PlanDefinition {
   id: PlanTier;

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import type { GameItem } from '../types/platform';
+import type { GameItem } from '../types/platform.js';
 import {
   ADMIN_ALLOWED_TABS,
   canAccessTab,
@@ -8,7 +8,7 @@ import {
   filterGamesForRole,
   getMyGamesForRole,
   USER_ALLOWED_TABS,
-} from './rbac';
+} from './rbac.js';
 
 const sampleGames: GameItem[] = [
   {

@@ -1,4 +1,4 @@
-import type { LiveEventType, TikTokIntegrationStatus } from '../src/types/platform';
+import type { LiveEventType, TikTokIntegrationStatus } from '../src/types/platform.js';
 
 export interface IncomingLiveStreamEvent {
   type: LiveEventType;

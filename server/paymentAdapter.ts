@@ -1,4 +1,4 @@
-import type { PlanTier } from '../src/types/platform';
+import type { PlanTier } from '../src/types/platform.js';
 
 export interface CheckoutPreparationResult {
   ready: boolean;

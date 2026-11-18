@@ -1,9 +1,9 @@
 import crypto from 'node:crypto';
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
-import { canCreateRule, PLANS } from '../src/lib/planLimits';
-import { evaluateRules } from '../src/lib/ruleEngine';
-import { isValidHexColor, validateRegistrationInput } from '../src/lib/validation';
-import { buildIsolatedHtmlBundle } from '../src/lib/zipValidator';
+import { canCreateRule, PLANS } from '../src/lib/planLimits.js';
+import { evaluateRules } from '../src/lib/ruleEngine.js';
+import { isValidHexColor, validateRegistrationInput } from '../src/lib/validation.js';
+import { buildIsolatedHtmlBundle } from '../src/lib/zipValidator.js';
 import type {
   AdminOverviewStats,
   EventRule,
@@ -14,8 +14,8 @@ import type {
   LiveEventType,
   OverlayConfig,
   PlanTier,
-} from '../src/types/platform';
-import { prepareMercadoPagoCheckout } from './paymentAdapter';
+} from '../src/types/platform.js';
+import { prepareMercadoPagoCheckout } from './paymentAdapter.js';
 import {
   addSubscriptionRecord,
   createDefaultOverlayConfig,
@@ -34,8 +34,8 @@ import {
   syncPrimaryAdminRole,
   type StoredUser,
   verifyPassword,
-} from './store';
-import { tiktokProvider } from './tiktokAdapter';
+} from './store.js';
+import { tiktokProvider } from './tiktokAdapter.js';
 
 const SESSION_COOKIE_NAME = 'mlg_session';
 
@@ -979,6 +979,11 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
       res.json({ platformSettings: db.platformSettings });
     }),
   );
+
+  // JSON 404 handler for unmatched API routes
+  app.use('/api', (_req: Request, res: Response) => {
+    res.status(404).json({ error: 'Endpoint da API não encontrado.' });
+  });
 
   // Global JSON error handler for API routes
   app.use('/api', (err: unknown, _req: Request, res: Response, _next: NextFunction) => {

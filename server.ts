@@ -4,9 +4,9 @@ import http from 'node:http';
 import path from 'node:path';
 import express from 'express';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { registerApiRoutes } from './server/app';
-import { findUserBySessionToken } from './server/store';
-import type { LiveEventPayload, OverlayConfig } from './src/types/platform';
+import { registerApiRoutes } from './server/app.js';
+import { findUserBySessionToken } from './server/store.js';
+import type { LiveEventPayload, OverlayConfig } from './src/types/platform.js';
 
 const PORT = Number(process.env.PORT || 3000);
 

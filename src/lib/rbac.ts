@@ -1,4 +1,4 @@
-import type { GameItem, UserRole } from '../types/platform';
+import type { GameItem, UserRole } from '../types/platform.js';
 
 export type DashboardTab =
   | 'overview'

@@ -27,8 +27,13 @@ const PATH_TO_TAB: Record<string, DashboardTab> = {
   '/dashboard/admin': 'admin',
 };
 
+function normalizePathname(raw: string): string {
+  const pathOnly = raw.split('?')[0].split('#')[0] || '/';
+  return pathOnly.length > 1 && pathOnly.endsWith('/') ? pathOnly.slice(0, -1) : pathOnly;
+}
+
 function resolveDashboardTab(pathname: string): DashboardTab | null {
-  const normalized = pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+  const normalized = normalizePathname(pathname);
   if (PATH_TO_TAB[normalized]) return PATH_TO_TAB[normalized];
   if (normalized.startsWith('/dashboard/')) return 'overview';
   return null;
@@ -36,20 +41,21 @@ function resolveDashboardTab(pathname: string): DashboardTab | null {
 
 function AppRouter() {
   const { user, loading } = useAuth();
-  const [pathname, setPathname] = useState(() => window.location.pathname);
+  const [pathname, setPathname] = useState(() => normalizePathname(window.location.pathname));
 
   useEffect(() => {
-    const onPopState = () => setPathname(window.location.pathname);
+    const onPopState = () => setPathname(normalizePathname(window.location.pathname));
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
   const navigate = useCallback((nextPath: string) => {
+    const cleanNext = normalizePathname(nextPath);
     if (window.location.pathname !== nextPath) {
       window.history.pushState({}, '', nextPath);
-      setPathname(nextPath);
-      window.scrollTo({ top: 0 });
     }
+    setPathname(cleanNext);
+    window.scrollTo({ top: 0 });
   }, []);
 
   // Standalone Overlay route (/overlay/ID-DO-JOGO) — works independently of dashboard/auth
@@ -78,6 +84,10 @@ function AppRouter() {
 
   if (pathname === '/recuperar-senha') {
     return <AuthPages mode="recover" onNavigate={navigate} />;
+  }
+
+  if (pathname === '/redefinir-senha') {
+    return <AuthPages mode="reset" onNavigate={navigate} />;
   }
 
   const dashboardTab = resolveDashboardTab(pathname);

@@ -59,10 +59,19 @@ export function OverlayPage({ gameId }: { gameId: string }) {
       }
     };
 
+    let failedAttempts = 0;
+    let openedOnce = false;
+
     const connectWs = () => {
+      if (closedByUser) return;
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const url = `${protocol}//${window.location.host}/ws?overlayId=${encodeURIComponent(gameId)}`;
       ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        openedOnce = true;
+        failedAttempts = 0;
+      };
 
       ws.onmessage = (msg) => {
         try {
@@ -78,9 +87,13 @@ export function OverlayPage({ gameId }: { gameId: string }) {
       };
 
       ws.onclose = () => {
-        if (!closedByUser) {
-          reconnectTimer = window.setTimeout(connectWs, 2000);
+        if (closedByUser) return;
+        failedAttempts += 1;
+        if (!openedOnce && failedAttempts >= 3) {
+          return;
         }
+        const delay = Math.min(15000, 2000 * failedAttempts);
+        reconnectTimer = window.setTimeout(connectWs, delay);
       };
     };
 

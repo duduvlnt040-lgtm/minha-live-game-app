@@ -45,7 +45,14 @@ export async function apiRequest<T>(
     try {
       data = JSON.parse(text);
     } catch {
-      data = { error: text };
+      const trimmed = text.trim();
+      const looksLikeHtmlOrNotFound =
+        trimmed.startsWith('<') || trimmed.includes('NOT_FOUND') || trimmed.includes('The page could not be found');
+      data = {
+        error: looksLikeHtmlOrNotFound
+          ? `Endpoint da API indisponível (${response.status}). Verifique o roteamento /api na hospedagem.`
+          : trimmed,
+      };
     }
   }
 

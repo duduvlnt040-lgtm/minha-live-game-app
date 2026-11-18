@@ -36,12 +36,24 @@ export interface PasswordResetToken {
 export interface DatabaseSchema {
   users: StoredUser[];
   sessions: SessionRecord[];
+  revokedSessionIds: string[];
   resetTokens: PasswordResetToken[];
   games: GameItem[];
   rules: EventRule[];
   events: LiveEventPayload[];
   subscriptions: SubscriptionRecord[];
   platformSettings: PlatformSettings;
+}
+
+export interface SignedTokenPayload {
+  sid: string;
+  uid: string;
+  email: string;
+  username: string;
+  name: string;
+  role: UserRole;
+  plan: PlanTier;
+  exp: number;
 }
 
 export function createDefaultOverlayConfig(): OverlayConfig {
@@ -73,12 +85,17 @@ export function createDefaultUserSettings(): UserSettings {
   };
 }
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const DATA_DIR = isServerless
+  ? path.join('/tmp', 'minha-live-games-data')
+  : path.resolve(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'store.json');
+const REMOTE_KV_KEY = 'mlg:db:v1';
 
 const EMPTY_DB: DatabaseSchema = {
   users: [],
   sessions: [],
+  revokedSessionIds: [],
   resetTokens: [],
   games: [],
   rules: [],
@@ -96,58 +113,144 @@ export const PRIMARY_ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'duduvlnt040@gmai
   .trim()
   .toLowerCase();
 
-function ensureDbLoaded(): DatabaseSchema {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+function getSessionSecret(): string {
+  const envSecret = (process.env.SESSION_SECRET || '').trim();
+  if (envSecret && envSecret !== 'troque-esta-chave-em-producao') {
+    return envSecret;
   }
-  if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(EMPTY_DB, null, 2), 'utf8');
-    return structuredClone(EMPTY_DB);
-  }
+  // Stable fallback secret derived from project/admin identifiers so tokens stay verifiable
+  // across serverless instances even before SESSION_SECRET is customized, while recommending
+  // setting SESSION_SECRET in production.
+  const seed = `${PRIMARY_ADMIN_EMAIL}:${process.env.VERCEL_PROJECT_ID || 'minha-live-games-local'}`;
+  return crypto.createHash('sha256').update(seed).digest('hex');
+}
+
+function getRemoteKvConfig(): { url: string; token: string } | null {
+  const url = (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '').trim();
+  const token = (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
+  if (!url || !token) return null;
+  return { url: url.replace(/\/+$/, ''), token };
+}
+
+export function isRemoteStorageConfigured(): boolean {
+  return getRemoteKvConfig() !== null;
+}
+
+function normalizeDbSchema(parsed: Partial<DatabaseSchema>): DatabaseSchema {
+  const users = Array.isArray(parsed.users)
+    ? parsed.users.map((u) => {
+        const emailLower = (u.email || '').trim().toLowerCase();
+        return {
+          ...u,
+          role: emailLower === PRIMARY_ADMIN_EMAIL ? ('admin' as UserRole) : u.role || 'user',
+          myGameIds: Array.isArray(u.myGameIds) ? u.myGameIds : [],
+        };
+      })
+    : [];
+  return {
+    users,
+    sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
+    revokedSessionIds: Array.isArray(parsed.revokedSessionIds) ? parsed.revokedSessionIds.slice(-500) : [],
+    resetTokens: Array.isArray(parsed.resetTokens) ? parsed.resetTokens : [],
+    games: Array.isArray(parsed.games) ? parsed.games : [],
+    rules: Array.isArray(parsed.rules) ? parsed.rules : [],
+    events: Array.isArray(parsed.events) ? parsed.events : [],
+    subscriptions: Array.isArray(parsed.subscriptions) ? parsed.subscriptions : [],
+    platformSettings: {
+      ...EMPTY_DB.platformSettings,
+      ...(parsed.platformSettings || {}),
+    },
+  };
+}
+
+function ensureLocalDbLoaded(): DatabaseSchema {
   try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    if (!fs.existsSync(DB_FILE)) {
+      fs.writeFileSync(DB_FILE, JSON.stringify(EMPTY_DB, null, 2), 'utf8');
+      return structuredClone(EMPTY_DB);
+    }
     const raw = fs.readFileSync(DB_FILE, 'utf8');
-    const parsed = JSON.parse(raw) as Partial<DatabaseSchema>;
-    const users = Array.isArray(parsed.users)
-      ? parsed.users.map((u) => {
-          const emailLower = (u.email || '').trim().toLowerCase();
-          return {
-            ...u,
-            role: emailLower === PRIMARY_ADMIN_EMAIL ? ('admin' as UserRole) : u.role || 'user',
-            myGameIds: Array.isArray(u.myGameIds) ? u.myGameIds : [],
-          };
-        })
-      : [];
-    return {
-      users,
-      sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
-      resetTokens: Array.isArray(parsed.resetTokens) ? parsed.resetTokens : [],
-      games: Array.isArray(parsed.games) ? parsed.games : [],
-      rules: Array.isArray(parsed.rules) ? parsed.rules : [],
-      events: Array.isArray(parsed.events) ? parsed.events : [],
-      subscriptions: Array.isArray(parsed.subscriptions) ? parsed.subscriptions : [],
-      platformSettings: {
-        ...EMPTY_DB.platformSettings,
-        ...(parsed.platformSettings || {}),
-      },
-    };
+    return normalizeDbSchema(JSON.parse(raw) as Partial<DatabaseSchema>);
   } catch {
     return structuredClone(EMPTY_DB);
   }
 }
 
-let dbCache: DatabaseSchema = ensureDbLoaded();
+let dbCache: DatabaseSchema = ensureLocalDbLoaded();
+let lastRemoteHydrateMs = 0;
+
+export async function hydrateDb(): Promise<DatabaseSchema> {
+  const kv = getRemoteKvConfig();
+  if (!kv) {
+    if (!isServerless && !fs.existsSync(DB_FILE)) {
+      dbCache = ensureLocalDbLoaded();
+    }
+    return dbCache;
+  }
+
+  // Always hydrate on serverless cold start or if stale > 1s
+  if (Date.now() - lastRemoteHydrateMs < 1000) {
+    return dbCache;
+  }
+
+  try {
+    const res = await fetch(`${kv.url}/get/${encodeURIComponent(REMOTE_KV_KEY)}`, {
+      headers: { Authorization: `Bearer ${kv.token}` },
+      cache: 'no-store',
+    });
+    if (res.ok) {
+      const json = (await res.json()) as { result?: string | null };
+      if (typeof json.result === 'string' && json.result.trim()) {
+        dbCache = normalizeDbSchema(JSON.parse(json.result) as Partial<DatabaseSchema>);
+      }
+      lastRemoteHydrateMs = Date.now();
+    }
+  } catch (err) {
+    console.warn('Falha ao hidratar banco remoto KV/Upstash, mantendo cache local:', err);
+  }
+
+  return dbCache;
+}
 
 export function getDb(): DatabaseSchema {
   return dbCache;
 }
 
 export function saveDb(): void {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    const tmpFile = `${DB_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(dbCache, null, 2), 'utf8');
+    fs.renameSync(tmpFile, DB_FILE);
+  } catch (err) {
+    if (!isServerless) {
+      console.warn('Falha ao salvar store local:', err);
+    }
   }
-  const tmpFile = `${DB_FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(tmpFile, JSON.stringify(dbCache, null, 2), 'utf8');
-  fs.renameSync(tmpFile, DB_FILE);
+}
+
+export async function flushDb(): Promise<void> {
+  saveDb();
+  const kv = getRemoteKvConfig();
+  if (!kv) return;
+  try {
+    await fetch(kv.url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${kv.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(['SET', REMOTE_KV_KEY, JSON.stringify(dbCache)]),
+    });
+    lastRemoteHydrateMs = Date.now();
+  } catch (err) {
+    console.warn('Falha ao persistir estado no KV/Upstash:', err);
+  }
 }
 
 export function hashPassword(password: string): string {
@@ -188,15 +291,66 @@ export function syncPrimaryAdminRole(user: StoredUser): void {
   }
 }
 
+function signSessionToken(payload: SignedTokenPayload): string {
+  const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', getSessionSecret())
+    .update(encoded)
+    .digest('base64url');
+  return `mlg1.${encoded}.${sig}`;
+}
+
+export function verifySignedSessionToken(token: string | undefined): SignedTokenPayload | null {
+  if (!token || !token.startsWith('mlg1.')) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [, encoded, sig] = parts;
+  const expectedSig = crypto
+    .createHmac('sha256', getSessionSecret())
+    .update(encoded)
+    .digest('base64url');
+
+  const sigBuf = Buffer.from(sig);
+  const expBuf = Buffer.from(expectedSig);
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as SignedTokenPayload;
+    if (!payload.uid || !payload.exp || payload.exp <= Date.now()) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
 export function createSession(userId: string): SessionRecord {
-  const token = crypto.randomBytes(32).toString('hex');
+  const user = dbCache.users.find((u) => u.id === userId);
   const now = new Date();
-  const expires = new Date(now.getTime() + 1000 * 60 * 60 * 24 * 7); // 7 days
+  const expiresMs = now.getTime() + 1000 * 60 * 60 * 24 * 7; // 7 days
+  const sid = crypto.randomBytes(16).toString('hex');
+
+  const token = user
+    ? signSessionToken({
+        sid,
+        uid: user.id,
+        email: user.email,
+        username: user.username,
+        name: user.name,
+        role: resolveInitialRole(user.email) === 'admin' ? 'admin' : user.role,
+        plan: user.plan,
+        exp: expiresMs,
+      })
+    : crypto.randomBytes(32).toString('hex');
+
   const record: SessionRecord = {
     token,
     userId,
     createdAt: now.toISOString(),
-    expiresAt: expires.toISOString(),
+    expiresAt: new Date(expiresMs).toISOString(),
   };
   dbCache.sessions = dbCache.sessions.filter(
     (s) => new Date(s.expiresAt).getTime() > Date.now(),
@@ -206,8 +360,58 @@ export function createSession(userId: string): SessionRecord {
   return record;
 }
 
+export function revokeSessionToken(token: string | undefined): void {
+  if (!token) return;
+  const signed = verifySignedSessionToken(token);
+  if (signed?.sid && !dbCache.revokedSessionIds.includes(signed.sid)) {
+    dbCache.revokedSessionIds.push(signed.sid);
+    if (dbCache.revokedSessionIds.length > 500) {
+      dbCache.revokedSessionIds = dbCache.revokedSessionIds.slice(-500);
+    }
+  }
+  dbCache.sessions = dbCache.sessions.filter((s) => s.token !== token);
+  saveDb();
+}
+
 export function findUserBySessionToken(token: string | undefined): StoredUser | null {
   if (!token) return null;
+
+  // 1. Check cryptographically signed mlg1.* token (works across serverless instances)
+  const signed = verifySignedSessionToken(token);
+  if (signed) {
+    if (dbCache.revokedSessionIds.includes(signed.sid)) {
+      return null;
+    }
+    const existing = dbCache.users.find((u) => u.id === signed.uid);
+    if (existing) {
+      if (existing.status !== 'active') return null;
+      syncPrimaryAdminRole(existing);
+      return existing;
+    }
+    // If running in ephemeral serverless memory without KV configured and the cold instance
+    // hasn't seen this user yet, materialize session user from verified HMAC claims.
+    if (isServerless && !isRemoteStorageConfigured()) {
+      const hydratedUser: StoredUser = {
+        id: signed.uid,
+        name: signed.name,
+        username: signed.username,
+        email: signed.email,
+        role: isPrimaryAdminEmail(signed.email) ? 'admin' : signed.role === 'admin' ? 'admin' : 'user',
+        plan: signed.plan || 'free',
+        status: 'active',
+        passwordHash: '',
+        createdAt: new Date().toISOString(),
+        settings: createDefaultUserSettings(),
+        myGameIds: [],
+      };
+      dbCache.users.push(hydratedUser);
+      saveDb();
+      return hydratedUser;
+    }
+    return null;
+  }
+
+  // 2. Fallback for legacy opaque session tokens in local store
   const session = dbCache.sessions.find((s) => s.token === token);
   if (!session) return null;
   if (new Date(session.expiresAt).getTime() <= Date.now()) {
@@ -217,6 +421,7 @@ export function findUserBySessionToken(token: string | undefined): StoredUser | 
   }
   const user = dbCache.users.find((u) => u.id === session.userId);
   if (!user || user.status !== 'active') return null;
+  syncPrimaryAdminRole(user);
   return user;
 }
 

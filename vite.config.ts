@@ -25,6 +25,19 @@ export default defineConfig(() => {
           if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
             fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
           }
+          const vendorFiles = [
+            ['node_modules/phaser/dist/phaser.min.js', 'phaser.min.js'],
+            ['node_modules/three/build/three.module.js', 'three.module.js'],
+            ['node_modules/three/build/three.core.js', 'three.core.js'],
+          ];
+          const distVendor = path.resolve(distDir, 'vendor');
+          for (const [srcRel, destName] of vendorFiles) {
+            const srcAbs = path.resolve(__dirname, srcRel);
+            if (fs.existsSync(distDir) && fs.existsSync(srcAbs)) {
+              fs.mkdirSync(distVendor, {recursive: true});
+              fs.copyFileSync(srcAbs, path.join(distVendor, destName));
+            }
+          }
         },
       },
     ],

@@ -70,9 +70,18 @@ npm install tiktok-live-connector
 ```
 *Nota: ambientes serverless puros (como funções curtas na Vercel) não mantêm conexões WebSocket de longa duração para scraping do TikTok; recomenda-se hospedar o worker WebSocket em um processo Node contínuo.*
 
-## Deploy na Vercel
+## Deploy na Vercel (Frontend + API Serverless)
 
-1. Envie o repositório para o GitHub/GitLab.
-2. Importe o projeto na [Vercel](https://vercel.com/).
-3. Adicione as variáveis de ambiente listadas em `.env.example`.
+O projeto possui roteamento configurado em `vercel.json` para servir o SPA React a partir de `dist/` e encaminhar todas as requisições `/api/*` para a Serverless Function `api/index.ts` (que compartilha as mesmas rotas de `server/app.ts`).
+
+1. Envie o repositório atualizado para o GitHub/GitLab.
+2. No painel da **Vercel** (`Project Settings -> Environment Variables`), configure:
+   - `ADMIN_EMAIL` = `duduvlnt040@gmail.com`
+   - `APP_URL` = `https://minha-live-game-app.vercel.app`
+   - `SESSION_SECRET` = chave aleatória longa (ex.: `openssl rand -hex 32`)
+3. **Persistência de contas e jogos em produção (recomendado — plano gratuito)**:
+   - No painel do projeto na Vercel, abra a aba **Storage** e conecte um banco **Upstash Redis** (ou **Vercel KV**).
+   - Isso cria automaticamente `KV_REST_API_URL` e `KV_REST_API_TOKEN` (ou `UPSTASH_REDIS_REST_URL` e `UPSTASH_REDIS_REST_TOKEN`), garantindo que contas, senhas, jogos publicados e regras persistam entre reinicializações e múltiplas instâncias serverless.
+   - *(Opcional)* Para envio real de e-mails de recuperação de senha, adicione `RESEND_API_KEY` e `EMAIL_FROM`.
 4. Comando de build: `npm run build` · Diretório de saída: `dist`.
+

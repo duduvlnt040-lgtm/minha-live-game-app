@@ -3,7 +3,7 @@ import express, { type Express, type NextFunction, type Request, type Response }
 import { canCreateRule, PLANS } from '../src/lib/planLimits.js';
 import { evaluateRules } from '../src/lib/ruleEngine.js';
 import { isValidHexColor, validateRegistrationInput } from '../src/lib/validation.js';
-import { buildIsolatedHtmlBundle } from '../src/lib/zipValidator.js';
+import { buildIsolatedHtmlBundle, preparePlayableHtml } from '../src/lib/zipValidator.js';
 import type {
   AdminOverviewStats,
   EventRule,
@@ -630,18 +630,63 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
       res.status(404).json({ error: 'Overlay não encontrado.' });
       return;
     }
+    const origin = process.env.APP_URL?.trim() || `${req.protocol}://${req.get('host')}`;
+    const playableHtml = game.isActive ? preparePlayableHtml(game.bundleHtml, origin) : '';
     res.json({
       overlay: {
         id: game.id,
         name: game.name,
         engine: game.engine,
         isActive: game.isActive,
-        bundleHtml: game.isActive ? game.bundleHtml : '',
+        bundleHtml: playableHtml,
         overlayConfig: game.overlayConfig,
         watermarkText: db.platformSettings.defaultWatermarkText || 'MINHA LIVE GAMES',
+        capabilities: {
+          websocket: !process.env.VERCEL,
+          pollingIntervalMs: 1200,
+        },
       },
     });
   });
+
+  // Public Overlay real-time polling endpoint (Vercel Serverless fallback for WebSocket /ws)
+  app.get(
+    '/api/overlay/:id/events',
+    asyncHandler(async (req, res) => {
+      const db = await hydrateDb(true);
+      const game = db.games.find((g) => g.id === req.params.id);
+      if (!game) {
+        res.status(404).json({ error: 'Overlay não encontrado.' });
+        return;
+      }
+
+      const rawSince = String(req.query.since || '').trim();
+      const sinceMs = rawSince
+        ? /^\d+$/.test(rawSince)
+          ? Number(rawSince)
+          : Date.parse(rawSince)
+        : 0;
+      const validSinceMs = Number.isFinite(sinceMs) && sinceMs > 0 ? sinceMs : 0;
+
+      const matching = db.events
+        .filter((e) => {
+          if (e.gameId !== game.id && e.gameId !== 'all') return false;
+          if (!validSinceMs) return false;
+          const evMs = Date.parse(e.createdAt);
+          return Number.isFinite(evMs) && evMs >= validSinceMs;
+        })
+        .slice(0, 30)
+        .reverse(); // Chronological order for dispatch
+
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        events: matching,
+        isActive: game.isActive,
+        overlayConfig: game.overlayConfig,
+        serverTime: new Date().toISOString(),
+      });
+    }),
+  );
 
   // ---------------------------------------------------------------------------
   // Event Rules & Simulation / Real-Time Events Endpoints

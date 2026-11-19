@@ -1,5 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Maximize2, Minimize2, Pause, Play, RotateCcw, Volume2, VolumeX } from 'lucide-react';
+import { preparePlayableHtml } from '../lib/zipValidator';
 import type { LiveEventPayload } from '../types/platform';
 
 interface GamePlayerProps {
@@ -21,6 +22,9 @@ export const GamePlayer = React.forwardRef<
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const frameReadyRef = useRef(false);
+  const pendingMessagesRef = useRef<Array<Record<string, unknown>>>([]);
+
   const [isRunning, setIsRunning] = useState(true);
   const [isMuted, setIsMuted] = useState(mutedDefault);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -28,9 +32,31 @@ export const GamePlayer = React.forwardRef<
   const [score, setScore] = useState<number>(0);
   const [sdkReady, setSdkReady] = useState(false);
 
-  const postToGame = (message: Record<string, unknown>) => {
-    iframeRef.current?.contentWindow?.postMessage(message, '*');
-  };
+  const playableHtml = useMemo(() => {
+    if (!bundleHtml) return '';
+    return preparePlayableHtml(bundleHtml, window.location.origin);
+  }, [bundleHtml]);
+
+  const flushPending = useCallback(() => {
+    const win = iframeRef.current?.contentWindow;
+    if (!win) return;
+    frameReadyRef.current = true;
+    while (pendingMessagesRef.current.length > 0) {
+      const next = pendingMessagesRef.current.shift();
+      if (next) win.postMessage(next, '*');
+    }
+  }, []);
+
+  const postToGame = useCallback((message: Record<string, unknown>) => {
+    const win = iframeRef.current?.contentWindow;
+    if (win && frameReadyRef.current) {
+      win.postMessage(message, '*');
+      return;
+    }
+    if (pendingMessagesRef.current.length < 50) {
+      pendingMessagesRef.current.push(message);
+    }
+  }, []);
 
   React.useImperativeHandle(ref, () => ({
     sendEvent: (ev: LiveEventPayload) => {
@@ -45,19 +71,26 @@ export const GamePlayer = React.forwardRef<
   }));
 
   useEffect(() => {
+    frameReadyRef.current = false;
+    pendingMessagesRef.current = [];
+    setSdkReady(false);
+  }, [playableHtml, iframeKey]);
+
+  useEffect(() => {
     const onMessage = (event: MessageEvent) => {
       if (event.source !== iframeRef.current?.contentWindow) return;
       const data = event.data;
       if (!data || typeof data !== 'object') return;
       if (data.type === 'MLG:READY') {
         setSdkReady(true);
+        flushPending();
       } else if (data.type === 'MLG:SCORE_UPDATE') {
         setScore(Number(data.score) || 0);
       }
     };
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, []);
+  }, [flushPending]);
 
   useEffect(() => {
     const onFsChange = () => {
@@ -79,6 +112,8 @@ export const GamePlayer = React.forwardRef<
 
   const handleRestart = () => {
     postToGame({ type: 'MLG:RESTART' });
+    frameReadyRef.current = false;
+    pendingMessagesRef.current = [];
     setSdkReady(false);
     setScore(0);
     setIsRunning(true);
@@ -173,8 +208,13 @@ export const GamePlayer = React.forwardRef<
             key={iframeKey}
             ref={iframeRef}
             title={`Player ${gameName}`}
-            srcDoc={bundleHtml}
-            sandbox="allow-scripts"
+            srcDoc={playableHtml}
+            sandbox="allow-scripts allow-forms allow-pointer-lock allow-popups allow-modals"
+            allow="autoplay; fullscreen; gamepad; clipboard-write"
+            onLoad={() => {
+              setSdkReady(true);
+              flushPending();
+            }}
             className="w-full h-full border-0"
           />
         )}

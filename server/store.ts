@@ -182,7 +182,7 @@ function ensureLocalDbLoaded(): DatabaseSchema {
 let dbCache: DatabaseSchema = ensureLocalDbLoaded();
 let lastRemoteHydrateMs = 0;
 
-export async function hydrateDb(): Promise<DatabaseSchema> {
+export async function hydrateDb(force = false): Promise<DatabaseSchema> {
   const kv = getRemoteKvConfig();
   if (!kv) {
     if (!isServerless && !fs.existsSync(DB_FILE)) {
@@ -191,8 +191,8 @@ export async function hydrateDb(): Promise<DatabaseSchema> {
     return dbCache;
   }
 
-  // Always hydrate on serverless cold start or if stale > 1s
-  if (Date.now() - lastRemoteHydrateMs < 1000) {
+  // Always hydrate on serverless cold start, forced polling, or if stale > 1s
+  if (!force && Date.now() - lastRemoteHydrateMs < 1000) {
     return dbCache;
   }
 

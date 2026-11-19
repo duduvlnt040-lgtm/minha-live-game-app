@@ -1,7 +1,13 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { WatermarkBadge, LoadingScreen } from '../components/BrandMark';
+import { preparePlayableHtml } from '../lib/zipValidator';
 import { apiRequest } from '../services/api';
 import type { LiveEventPayload, OverlayConfig } from '../types/platform';
+
+interface OverlayCapabilities {
+  websocket: boolean;
+  pollingIntervalMs?: number;
+}
 
 interface OverlayData {
   id: string;
@@ -11,6 +17,14 @@ interface OverlayData {
   bundleHtml: string;
   overlayConfig: OverlayConfig;
   watermarkText: string;
+  capabilities?: OverlayCapabilities;
+}
+
+interface OverlayEventsPollResponse {
+  events: LiveEventPayload[];
+  isActive: boolean;
+  overlayConfig: OverlayConfig;
+  serverTime: string;
 }
 
 export function OverlayPage({ gameId }: { gameId: string }) {
@@ -18,10 +32,22 @@ export function OverlayPage({ gameId }: { gameId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [lastToast, setLastToast] = useState<string | null>(null);
+
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const frameReadyRef = useRef(false);
+  const pendingMessagesRef = useRef<Array<Record<string, unknown>>>([]);
+  const seenEventIdsRef = useRef<Set<string>>(new Set());
+  const toastTimerRef = useRef<number | undefined>(undefined);
+  const sinceCursorRef = useRef<string>(new Date().toISOString());
 
   useEffect(() => {
     let cancelled = false;
+    setLoading(true);
+    frameReadyRef.current = false;
+    pendingMessagesRef.current = [];
+    seenEventIdsRef.current.clear();
+    sinceCursorRef.current = new Date().toISOString();
+
     apiRequest<{ overlay: OverlayData }>(`/api/overlay/${encodeURIComponent(gameId)}`)
       .then((res) => {
         if (!cancelled) setOverlay(res.overlay);
@@ -37,69 +63,164 @@ export function OverlayPage({ gameId }: { gameId: string }) {
     };
   }, [gameId]);
 
+  const playableHtml = useMemo(() => {
+    if (!overlay?.bundleHtml) return '';
+    return preparePlayableHtml(overlay.bundleHtml, window.location.origin);
+  }, [overlay?.bundleHtml]);
+
+  const postOrQueueToGame = useCallback((message: Record<string, unknown>) => {
+    const win = iframeRef.current?.contentWindow;
+    if (win && frameReadyRef.current) {
+      win.postMessage(message, '*');
+      return;
+    }
+    if (pendingMessagesRef.current.length < 50) {
+      pendingMessagesRef.current.push(message);
+    }
+  }, []);
+
+  const flushPendingToGame = useCallback(() => {
+    const win = iframeRef.current?.contentWindow;
+    if (!win) return;
+    frameReadyRef.current = true;
+    while (pendingMessagesRef.current.length > 0) {
+      const next = pendingMessagesRef.current.shift();
+      if (next) win.postMessage(next, '*');
+    }
+  }, []);
+
+  useEffect(() => {
+    const onFrameMessage = (ev: MessageEvent) => {
+      if (ev.source !== iframeRef.current?.contentWindow) return;
+      if (ev.data && typeof ev.data === 'object' && ev.data.type === 'MLG:READY') {
+        flushPendingToGame();
+      }
+    };
+    window.addEventListener('message', onFrameMessage);
+    return () => window.removeEventListener('message', onFrameMessage);
+  }, [flushPendingToGame]);
+
+  const showToastEnabled = overlay?.overlayConfig.showEventToast ?? true;
+  const wsSupported = overlay?.capabilities?.websocket ?? false;
+  const pollingIntervalMs = overlay?.capabilities?.pollingIntervalMs ?? 1200;
+
   useEffect(() => {
     if (!overlay) return;
     let ws: WebSocket | null = null;
     let reconnectTimer: number | undefined;
+    let pollTimer: number | undefined;
     let closedByUser = false;
 
     const dispatchToGame = (event: LiveEventPayload) => {
-      const win = iframeRef.current?.contentWindow;
-      if (win) {
-        win.postMessage({ type: 'MLG:EVENT', event }, '*');
-        for (const cmd of event.triggeredCommands || []) {
-          win.postMessage({ type: 'MLG:COMMAND', command: cmd }, '*');
+      if (event.id) {
+        if (seenEventIdsRef.current.has(event.id)) return;
+        seenEventIdsRef.current.add(event.id);
+        if (seenEventIdsRef.current.size > 300) {
+          const oldest = seenEventIdsRef.current.values().next().value;
+          if (oldest) seenEventIdsRef.current.delete(oldest);
         }
       }
-      if (overlay.overlayConfig.showEventToast) {
+
+      postOrQueueToGame({ type: 'MLG:EVENT', event });
+      for (const cmd of event.triggeredCommands || []) {
+        postOrQueueToGame({ type: 'MLG:COMMAND', command: cmd });
+      }
+
+      if (showToastEnabled) {
+        if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
         setLastToast(
           `@${event.senderUsername}: ${event.giftName || event.commentText || event.type}`,
         );
-        window.setTimeout(() => setLastToast(null), 3500);
+        toastTimerRef.current = window.setTimeout(() => setLastToast(null), 3500);
       }
     };
 
-    let failedAttempts = 0;
-    let openedOnce = false;
+    if (wsSupported) {
+      let failedAttempts = 0;
+      let openedOnce = false;
 
-    const connectWs = () => {
-      if (closedByUser) return;
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = `${protocol}//${window.location.host}/ws?overlayId=${encodeURIComponent(gameId)}`;
-      ws = new WebSocket(url);
-
-      ws.onopen = () => {
-        openedOnce = true;
-        failedAttempts = 0;
-      };
-
-      ws.onmessage = (msg) => {
-        try {
-          const parsed = JSON.parse(msg.data);
-          if (parsed.type === 'MLG_LIVE_EVENT' && parsed.event) {
-            dispatchToGame(parsed.event as LiveEventPayload);
-          } else if (parsed.type === 'MLG_OVERLAY_CONFIG' && parsed.overlayConfig) {
-            setOverlay((prev) => (prev ? { ...prev, overlayConfig: parsed.overlayConfig } : prev));
-          }
-        } catch {
-          // ignore malformed messages
-        }
-      };
-
-      ws.onclose = () => {
+      const connectWs = () => {
         if (closedByUser) return;
-        failedAttempts += 1;
-        if (!openedOnce && failedAttempts >= 3) {
-          return;
-        }
-        const delay = Math.min(15000, 2000 * failedAttempts);
-        reconnectTimer = window.setTimeout(connectWs, delay);
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const url = `${protocol}//${window.location.host}/ws?overlayId=${encodeURIComponent(gameId)}`;
+        ws = new WebSocket(url);
+
+        ws.onopen = () => {
+          openedOnce = true;
+          failedAttempts = 0;
+        };
+
+        ws.onmessage = (msg) => {
+          try {
+            const parsed = JSON.parse(msg.data);
+            if (parsed.type === 'MLG_LIVE_EVENT' && parsed.event) {
+              dispatchToGame(parsed.event as LiveEventPayload);
+            } else if (parsed.type === 'MLG_OVERLAY_CONFIG' && parsed.overlayConfig) {
+              setOverlay((prev) => (prev ? { ...prev, overlayConfig: parsed.overlayConfig } : prev));
+            }
+          } catch {
+            // ignore malformed messages
+          }
+        };
+
+        ws.onclose = () => {
+          if (closedByUser) return;
+          failedAttempts += 1;
+          if (!openedOnce && failedAttempts >= 3) {
+            return;
+          }
+          const delay = Math.min(15000, 2000 * failedAttempts);
+          reconnectTimer = window.setTimeout(connectWs, delay);
+        };
       };
-    };
 
-    connectWs();
+      connectWs();
+    } else {
+      // Serverless runtime (e.g. Vercel): poll real-time event sync endpoint
+      const pollEvents = async () => {
+        if (closedByUser) return;
+        try {
+          const data = await apiRequest<OverlayEventsPollResponse>(
+            `/api/overlay/${encodeURIComponent(gameId)}/events?since=${encodeURIComponent(sinceCursorRef.current)}`,
+          );
+          if (closedByUser) return;
 
-    // Same-browser BroadcastChannel fallback
+          if (Array.isArray(data.events) && data.events.length > 0) {
+            for (const ev of data.events) {
+              dispatchToGame(ev);
+              if (ev.createdAt) {
+                sinceCursorRef.current = ev.createdAt;
+              }
+            }
+          } else if (data.serverTime) {
+            sinceCursorRef.current = data.serverTime;
+          }
+
+          setOverlay((prev) => {
+            if (!prev) return prev;
+            const changedActive = prev.isActive !== data.isActive;
+            const changedCfg =
+              JSON.stringify(prev.overlayConfig) !== JSON.stringify(data.overlayConfig);
+            if (!changedActive && !changedCfg) return prev;
+            return {
+              ...prev,
+              isActive: data.isActive,
+              overlayConfig: data.overlayConfig,
+            };
+          });
+        } catch {
+          // Retry gracefully on next interval
+        } finally {
+          if (!closedByUser) {
+            pollTimer = window.setTimeout(() => void pollEvents(), pollingIntervalMs);
+          }
+        }
+      };
+
+      pollTimer = window.setTimeout(() => void pollEvents(), pollingIntervalMs);
+    }
+
+    // Instant same-browser BroadcastChannel fallback
     const channel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('mlg_events') : null;
     if (channel) {
       channel.onmessage = (ev) => {
@@ -113,10 +234,12 @@ export function OverlayPage({ gameId }: { gameId: string }) {
     return () => {
       closedByUser = true;
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (pollTimer) window.clearTimeout(pollTimer);
+      if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
       ws?.close();
       channel?.close();
     };
-  }, [gameId, overlay?.id, overlay?.overlayConfig.showEventToast]);
+  }, [gameId, overlay?.id, pollingIntervalMs, postOrQueueToGame, showToastEnabled, wsSupported]);
 
   if (loading) {
     return <LoadingScreen label="Conectando overlay em tempo real..." />;
@@ -167,8 +290,10 @@ export function OverlayPage({ gameId }: { gameId: string }) {
         <iframe
           ref={iframeRef}
           title={`Overlay ${overlay.name}`}
-          srcDoc={overlay.bundleHtml}
-          sandbox="allow-scripts"
+          srcDoc={playableHtml}
+          sandbox="allow-scripts allow-forms allow-pointer-lock allow-popups allow-modals"
+          allow="autoplay; fullscreen; gamepad; clipboard-write"
+          onLoad={flushPendingToGame}
           className="w-full h-full border-0 bg-transparent"
         />
       </div>

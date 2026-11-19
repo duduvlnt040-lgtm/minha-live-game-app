@@ -4,6 +4,8 @@ import { AlertCircle, CheckCircle2, Download, FileArchive, ImagePlus, Upload } f
 import { GAME_TEMPLATES } from '../../lib/gameTemplates';
 import {
   buildIsolatedHtmlBundle,
+  inferMimeType,
+  isTextArchiveFile,
   MAX_GAME_FILES,
   MAX_TOTAL_UNCOMPRESSED_BYTES,
   validateArchiveEntryPath,
@@ -88,7 +90,20 @@ export function ImportGameSection({ onCreateGame, onImported }: ImportGameSectio
         let count = 0;
         let totalSize = 0;
 
-        const entries = Object.values(zip.files).filter((z) => !z.dir);
+        const entries = Object.values(zip.files).filter((z) => {
+          if (z.dir) return false;
+          const norm = z.name.replace(/\\/g, '/');
+          if (
+            norm.startsWith('__MACOSX/') ||
+            norm.endsWith('/.DS_Store') ||
+            norm === '.DS_Store' ||
+            norm.endsWith('/Thumbs.db') ||
+            norm === 'Thumbs.db'
+          ) {
+            return false;
+          }
+          return true;
+        });
         if (entries.length === 0) {
           setError('O pacote ZIP está vazio.');
           return;
@@ -104,7 +119,14 @@ export function ImportGameSection({ onCreateGame, onImported }: ImportGameSectio
             setError(check.error || 'Arquivo inválido no ZIP.');
             return;
           }
-          const content = await entryObj.async('string');
+          let content: string;
+          if (isTextArchiveFile(entryObj.name)) {
+            content = await entryObj.async('string');
+          } else {
+            const b64 = await entryObj.async('base64');
+            const mime = inferMimeType(entryObj.name);
+            content = `data:${mime};base64,${b64}`;
+          }
           totalSize += content.length;
           if (totalSize > MAX_TOTAL_UNCOMPRESSED_BYTES) {
             setError('Conteúdo descompactado excede 25 MB.');
@@ -114,11 +136,11 @@ export function ImportGameSection({ onCreateGame, onImported }: ImportGameSectio
           count += 1;
         }
 
-        const htmlFiles = Object.keys(extracted).filter((k) => k.toLowerCase().endsWith('.html'));
+        const htmlFiles = Object.keys(extracted).filter((k) => /\.html?$/i.test(k));
         const detectedEntry =
           extracted['index.html'] !== undefined
             ? 'index.html'
-            : htmlFiles[0] || entryFile;
+            : htmlFiles.find((k) => /(^|\/)index\.html?$/i.test(k)) || htmlFiles[0] || entryFile;
 
         setEntryFile(detectedEntry);
         setFilesMap(extracted);

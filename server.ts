@@ -4,8 +4,13 @@ import http from 'node:http';
 import path from 'node:path';
 import express from 'express';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { registerApiRoutes } from './server/app.js';
-import { findUserBySessionToken } from './server/store.js';
+import {
+  ACCESS_COOKIE_NAME,
+  parseCookies,
+  REFRESH_COOKIE_NAME,
+  registerApiRoutes,
+} from './server/app.js';
+import { findUserByAccessToken } from './server/store.js';
 import type { LiveEventPayload, OverlayConfig } from './src/types/platform.js';
 
 const PORT = Number(process.env.PORT || 3000);
@@ -50,22 +55,33 @@ async function startServer(): Promise<void> {
   const wss = new WebSocketServer({ server, path: '/ws' });
   const wsSubscribers = new Map<WebSocket, { overlayId?: string; userId?: string }>();
 
-  wss.on('connection', (socket, req) => {
+  wss.on('connection', async (socket, req) => {
     const reqUrl = new URL(req.url || '/ws', `http://${req.headers.host || 'localhost'}`);
     const overlayId = reqUrl.searchParams.get('overlayId') || undefined;
-    const token = reqUrl.searchParams.get('token') || undefined;
-    const user = findUserBySessionToken(token);
+    const cookies = parseCookies(req.headers.cookie);
+    const token = reqUrl.searchParams.get('token') || cookies[ACCESS_COOKIE_NAME] || undefined;
+    const refreshToken = cookies[REFRESH_COOKIE_NAME] || undefined;
+
+    let userId: string | undefined;
+    if (token || refreshToken) {
+      try {
+        const resolved = await findUserByAccessToken(token, refreshToken);
+        userId = resolved?.user.id;
+      } catch {
+        userId = undefined;
+      }
+    }
 
     wsSubscribers.set(socket, {
       overlayId,
-      userId: user?.id,
+      userId,
     });
 
     socket.send(
       JSON.stringify({
         type: 'MLG_WS_CONNECTED',
         overlayId: overlayId ?? null,
-        authenticated: Boolean(user),
+        authenticated: Boolean(userId),
         timestamp: new Date().toISOString(),
       }),
     );

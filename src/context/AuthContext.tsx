@@ -1,6 +1,13 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import { apiRequest, getStoredToken, setStoredToken } from '../services/api';
+import { getBrowserSupabaseClient } from '../lib/supabase';
+import { apiRequest } from '../services/api';
 import type { UserProfile, UserSettings } from '../types/platform';
+
+interface SessionTokens {
+  access_token: string;
+  refresh_token: string;
+  expires_at?: number;
+}
 
 interface AuthContextValue {
   user: UserProfile | null;
@@ -21,21 +28,36 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+async function syncBrowserSupabaseSession(session?: SessionTokens | null): Promise<void> {
+  if (!session?.access_token || !session?.refresh_token) return;
+  try {
+    const supabase = getBrowserSupabaseClient();
+    if (!supabase) return;
+    await supabase.auth.setSession({
+      access_token: session.access_token,
+      refresh_token: session.refresh_token,
+    });
+  } catch {
+    // Backend HttpOnly cookies keep session functional even if storage is blocked
+  }
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
 
   const refreshUser = useCallback(async () => {
     try {
-      const data = await apiRequest<{ authenticated: boolean; user: UserProfile | null; token?: string }>(
-        '/api/auth/session',
-      );
-      setUser(data.user);
-      if (data.token) {
-        setStoredToken(data.token);
-      } else if (getStoredToken()) {
-        setStoredToken(null);
+      const data = await apiRequest<{
+        authenticated: boolean;
+        user: UserProfile | null;
+        session?: SessionTokens;
+      }>('/api/auth/session');
+
+      if (data.session) {
+        await syncBrowserSupabaseSession(data.session);
       }
+      setUser(data.user);
     } catch {
       setUser(null);
     } finally {
@@ -45,14 +67,37 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     void refreshUser();
+
+    const supabase = getBrowserSupabaseClient();
+    if (!supabase) return;
+
+    const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_OUT') {
+        setUser(null);
+        return;
+      }
+      if (event === 'TOKEN_REFRESHED' && session?.access_token && session?.refresh_token) {
+        void apiRequest('/api/auth/sync-session', {
+          method: 'POST',
+          body: JSON.stringify({
+            access_token: session.access_token,
+            refresh_token: session.refresh_token,
+          }),
+        }).catch(() => {});
+      }
+    });
+
+    return () => {
+      listener.subscription.unsubscribe();
+    };
   }, [refreshUser]);
 
   const login = useCallback(async (identifier: string, password: string) => {
-    const data = await apiRequest<{ user: UserProfile; token: string }>('/api/auth/login', {
+    const data = await apiRequest<{ user: UserProfile; session?: SessionTokens }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ identifier, password }),
     });
-    setStoredToken(data.token);
+    await syncBrowserSupabaseSession(data.session);
     setUser(data.user);
   }, []);
 
@@ -64,11 +109,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       password: string;
       confirmPassword: string;
     }) => {
-      const data = await apiRequest<{ user: UserProfile; token: string }>('/api/auth/register', {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      });
-      setStoredToken(data.token);
+      const data = await apiRequest<{ user: UserProfile; session?: SessionTokens }>(
+        '/api/auth/register',
+        {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        },
+      );
+      await syncBrowserSupabaseSession(data.session);
       setUser(data.user);
     },
     [],
@@ -78,7 +126,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       await apiRequest('/api/auth/logout', { method: 'POST' });
     } finally {
-      setStoredToken(null);
+      try {
+        await getBrowserSupabaseClient()?.auth.signOut();
+      } catch {
+        // Ignore browser signout errors
+      }
       setUser(null);
     }
   }, []);

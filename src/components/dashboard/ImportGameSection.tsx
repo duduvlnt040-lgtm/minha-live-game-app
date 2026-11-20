@@ -10,7 +10,6 @@ import {
   MAX_TOTAL_UNCOMPRESSED_BYTES,
   validateArchiveEntryPath,
 } from '../../lib/zipValidator';
-import { gameArchiveStorage } from '../../services/storageAdapter';
 import type { GameCategory, GameEngine, GameItem } from '../../types/platform';
 import { GamePlayer } from '../GamePlayer';
 
@@ -196,7 +195,7 @@ export function ImportGameSection({ onCreateGame, onImported }: ImportGameSectio
 
     setSubmitting(true);
     try {
-      const created = await onCreateGame({
+      await onCreateGame({
         name: name.trim(),
         description: description.trim(),
         category,
@@ -205,18 +204,6 @@ export function ImportGameSection({ onCreateGame, onImported }: ImportGameSectio
         coverImage,
         files: filesMap,
       });
-
-      // Save raw archive locally in IndexedDB via StorageAdapter
-      try {
-        await gameArchiveStorage.saveArchive({
-          gameId: created.id,
-          files: filesMap,
-          totalSizeBytes: created.totalSizeBytes,
-          updatedAt: created.updatedAt,
-        });
-      } catch {
-        // IndexedDB optional fallback
-      }
 
       onImported();
     } catch (err) {

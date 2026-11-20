@@ -36,7 +36,6 @@ import {
   type DashboardTab,
 } from '../lib/rbac';
 import { apiRequest } from '../services/api';
-import { gameArchiveStorage } from '../services/storageAdapter';
 import type {
   EventRule,
   GameCategory,
@@ -145,11 +144,6 @@ export function DashboardPage({ initialTab = 'overview', onNavigate }: Dashboard
     await apiRequest(`/api/games/${id}`, { method: 'DELETE' });
     setGames((prev) => prev.filter((g) => g.id !== id));
     setRules((prev) => prev.filter((r) => r.gameId !== id));
-    try {
-      await gameArchiveStorage.deleteArchive(id);
-    } catch {
-      // ignore IndexedDB cleanup failure
-    }
   };
 
   const handleUpdateOverlay = async (gameId: string, overlayConfig: OverlayConfig) => {

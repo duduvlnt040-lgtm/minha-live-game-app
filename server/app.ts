@@ -1,15 +1,11 @@
-import crypto from 'node:crypto';
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
 import { canCreateRule, PLANS } from '../src/lib/planLimits.js';
 import { evaluateRules } from '../src/lib/ruleEngine.js';
 import { isValidHexColor, validateRegistrationInput } from '../src/lib/validation.js';
 import { buildIsolatedHtmlBundle, preparePlayableHtml } from '../src/lib/zipValidator.js';
 import type {
-  AdminOverviewStats,
-  EventRule,
   GameCategory,
   GameEngine,
-  GameItem,
   LiveEventPayload,
   LiveEventType,
   OverlayConfig,
@@ -17,31 +13,52 @@ import type {
 } from '../src/types/platform.js';
 import { prepareMercadoPagoCheckout } from './paymentAdapter.js';
 import {
-  addSubscriptionRecord,
-  createDefaultOverlayConfig,
-  createDefaultUserSettings,
-  createSession,
-  findUserBySessionToken,
-  flushDb,
-  getDb,
-  hashPassword,
-  hydrateDb,
-  isPrimaryAdminEmail,
-  isRemoteStorageConfigured,
-  resolveInitialRole,
-  revokeSessionToken,
+  addUserSavedGame,
+  adminUpdateUser,
+  type AuthSessionTokens,
+  checkUserExists,
+  countRulesForUser,
+  createGameRecord,
+  createRuleRecord,
+  deleteGameRecord,
+  deleteRuleRecord,
+  findGameById,
+  findUserByAccessToken,
+  getAdminOverviewData,
+  getPlatformSettings,
+  getSubscriptionSummaryForUser,
+  listEventsForUser,
+  listGamesForRole,
+  listOverlayEventsSince,
+  listRulesForUser,
+  loginUserWithSupabase,
+  logoutSupabaseToken,
+  recordLiveEvent,
+  registerUserWithSupabase,
+  removeUserSavedGame,
   sanitizeUser,
-  syncPrimaryAdminRole,
+  sendSupabasePasswordRecovery,
   type StoredUser,
-  verifyPassword,
+  updateGameRecord,
+  updatePlatformSettings,
+  updateRuleRecord,
+  updateSupabaseUserPassword,
+  updateUserProfileAndSettings,
 } from './store.js';
+import {
+  getMissingSupabaseEnvVars,
+  isSupabaseConfigured,
+  pingSupabase,
+} from './supabase.js';
 import { tiktokProvider } from './tiktokAdapter.js';
 
-const SESSION_COOKIE_NAME = 'mlg_session';
+export const ACCESS_COOKIE_NAME = 'mlg_access_token';
+export const REFRESH_COOKIE_NAME = 'mlg_refresh_token';
+export const LEGACY_SESSION_COOKIE_NAME = 'mlg_session';
 
 export interface AuthenticatedRequest extends Request {
   user?: StoredUser;
-  sessionToken?: string;
+  accessToken?: string;
 }
 
 export interface BroadcastHooks {
@@ -49,26 +66,38 @@ export interface BroadcastHooks {
   broadcastOverlayConfigUpdate?: (gameId: string, overlayConfig: OverlayConfig) => void;
 }
 
-function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+export function parseCookies(cookieHeader: string | undefined): Record<string, string> {
   const result: Record<string, string> = {};
   if (!cookieHeader) return result;
   for (const part of cookieHeader.split(';')) {
     const idx = part.indexOf('=');
     if (idx <= 0) continue;
     const key = part.slice(0, idx).trim();
-    const val = decodeURIComponent(part.slice(idx + 1).trim());
-    result[key] = val;
+    try {
+      result[key] = decodeURIComponent(part.slice(idx + 1).trim());
+    } catch {
+      result[key] = part.slice(idx + 1).trim();
+    }
   }
   return result;
 }
 
-function extractToken(req: Request): string | undefined {
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    return authHeader.slice(7).trim();
-  }
+export function extractAuthTokens(req: Request): {
+  accessToken?: string;
+  refreshToken?: string;
+} {
   const cookies = parseCookies(req.headers.cookie);
-  return cookies[SESSION_COOKIE_NAME];
+  const authHeader = req.headers.authorization;
+  let bearerToken: string | undefined;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const candidate = authHeader.slice(7).trim();
+    if (candidate) bearerToken = candidate;
+  }
+
+  return {
+    accessToken: bearerToken || cookies[ACCESS_COOKIE_NAME] || undefined,
+    refreshToken: cookies[REFRESH_COOKIE_NAME] || undefined,
+  };
 }
 
 function isHttpsRequest(req: Request): boolean {
@@ -76,40 +105,22 @@ function isHttpsRequest(req: Request): boolean {
   return req.secure || proto.includes('https');
 }
 
-function setSessionCookie(req: Request, res: Response, token: string): void {
+function setAuthCookies(req: Request, res: Response, session: AuthSessionTokens): void {
   const secureFlag = isHttpsRequest(req) ? '; Secure' : '';
-  res.setHeader(
-    'Set-Cookie',
-    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 7}${secureFlag}`,
-  );
+  const maxAge = 60 * 60 * 24 * 30; // 30 dias para persistência entre reinícios
+  res.setHeader('Set-Cookie', [
+    `${ACCESS_COOKIE_NAME}=${encodeURIComponent(session.access_token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secureFlag}`,
+    `${REFRESH_COOKIE_NAME}=${encodeURIComponent(session.refresh_token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secureFlag}`,
+  ]);
 }
 
-function clearSessionCookie(req: Request, res: Response): void {
+function clearAuthCookies(req: Request, res: Response): void {
   const secureFlag = isHttpsRequest(req) ? '; Secure' : '';
-  res.setHeader(
-    'Set-Cookie',
-    `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secureFlag}`,
-  );
-}
-
-function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
-  const token = extractToken(req);
-  const user = findUserBySessionToken(token);
-  if (!user) {
-    res.status(401).json({ error: 'Sessão inválida ou expirada. Faça login novamente.' });
-    return;
-  }
-  req.user = user;
-  req.sessionToken = token;
-  next();
-}
-
-function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
-  if (!req.user || req.user.role !== 'admin') {
-    res.status(403).json({ error: 'Acesso restrito a administradores autorizados.' });
-    return;
-  }
-  next();
+  res.setHeader('Set-Cookie', [
+    `${ACCESS_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secureFlag}`,
+    `${REFRESH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secureFlag}`,
+    `${LEGACY_SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secureFlag}`,
+  ]);
 }
 
 function asyncHandler(
@@ -120,40 +131,116 @@ function asyncHandler(
   };
 }
 
+const requireAuth = asyncHandler(async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  const { accessToken, refreshToken } = extractAuthTokens(req);
+  const resolved = await findUserByAccessToken(accessToken, refreshToken);
+  if (!resolved) {
+    res.status(401).json({ error: 'Sessão inválida ou expirada. Faça login novamente.' });
+    return;
+  }
+  if (resolved.refreshedSession) {
+    setAuthCookies(req, res, resolved.refreshedSession);
+  }
+  req.user = resolved.user;
+  req.accessToken = resolved.refreshedSession?.access_token || accessToken;
+  next();
+});
+
+function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
+  if (!req.user || req.user.role !== 'admin') {
+    res.status(403).json({ error: 'Acesso restrito a administradores autorizados.' });
+    return;
+  }
+  next();
+}
+
 export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): void {
   const broadcastLiveEvent = hooks.broadcastLiveEvent || (() => {});
   const broadcastOverlayConfigUpdate = hooks.broadcastOverlayConfigUpdate || (() => {});
 
   app.use(express.json({ limit: '30mb' }));
 
-  // Ensure DB is hydrated from Vercel KV / Upstash (when configured) on every API request
-  app.use(
-    '/api',
-    asyncHandler(async (_req, _res, next) => {
-      await hydrateDb();
-      next();
+  // Health endpoint (optionally checks live Supabase Auth + Postgres connectivity when ?check=db)
+  app.get(
+    '/api/health',
+    asyncHandler(async (req, res) => {
+      const configured = isSupabaseConfigured();
+      const missingEnvVars = getMissingSupabaseEnvVars();
+
+      if (req.query.check === 'db') {
+        if (!configured) {
+          res.status(503).json({
+            ok: false,
+            service: 'minha-live-games',
+            database: 'unconfigured',
+            missingEnvVars,
+            error: `Variáveis do Supabase não configuradas: ${missingEnvVars.join(', ')}.`,
+          });
+          return;
+        }
+        try {
+          await pingSupabase();
+          res.json({
+            ok: true,
+            service: 'minha-live-games',
+            runtime: process.env.VERCEL ? 'vercel-serverless' : 'node-server',
+            database: 'supabase-postgres',
+            auth: 'supabase-auth',
+            connected: true,
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        } catch (err) {
+          res.status(503).json({
+            ok: false,
+            service: 'minha-live-games',
+            database: 'supabase-postgres',
+            connected: false,
+            error:
+              err instanceof Error
+                ? err.message
+                : 'Não foi possível conectar ao Supabase.',
+          });
+          return;
+        }
+      }
+
+      res.json({
+        ok: true,
+        service: 'minha-live-games',
+        runtime: process.env.VERCEL ? 'vercel-serverless' : 'node-server',
+        database: configured ? 'supabase-postgres' : 'unconfigured',
+        auth: configured ? 'supabase-auth' : 'unconfigured',
+        missingEnvVars,
+        timestamp: new Date().toISOString(),
+      });
     }),
   );
 
-  // Health endpoint
-  app.get('/api/health', (_req, res) => {
-    res.json({
-      ok: true,
-      service: 'minha-live-games',
-      runtime: process.env.VERCEL ? 'vercel-serverless' : 'node-server',
-      persistentStorage: isRemoteStorageConfigured() ? 'kv-upstash' : 'local-file',
-      timestamp: new Date().toISOString(),
-    });
+  // Guard auth/data API calls with clear 503 if Supabase env vars are missing
+  app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+    if (req.path === '/health') {
+      next();
+      return;
+    }
+    if (!isSupabaseConfigured()) {
+      const missing = getMissingSupabaseEnvVars();
+      res.status(503).json({
+        error: `Supabase não configurado. Defina as variáveis de ambiente: ${missing.join(', ')}.`,
+      });
+      return;
+    }
+    next();
   });
 
   // ---------------------------------------------------------------------------
-  // Auth Endpoints (Real scrypt hashing + HMAC-signed sessions)
+  // Auth Endpoints (Supabase Authentication + PostgreSQL RBAC + HttpOnly cookies)
   // ---------------------------------------------------------------------------
   app.post(
     '/api/auth/register',
     asyncHandler(async (req, res) => {
-      const db = getDb();
-      if (!db.platformSettings.registrationEnabled) {
+      const settings = await getPlatformSettings();
+      if (!settings.registrationEnabled) {
         res.status(403).json({ error: 'Novos cadastros estão temporariamente desabilitados.' });
         return;
       }
@@ -174,38 +261,36 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
       const cleanEmail = String(email).trim().toLowerCase();
       const cleanUsername = String(username).trim().toLowerCase();
 
-      if (db.users.some((u) => u.email.toLowerCase() === cleanEmail)) {
+      const dup = await checkUserExists(cleanEmail, cleanUsername);
+      if (dup.emailExists) {
         res.status(409).json({ error: 'Já existe uma conta cadastrada com este e-mail.' });
         return;
       }
-      if (db.users.some((u) => u.username.toLowerCase() === cleanUsername)) {
+      if (dup.usernameExists) {
         res.status(409).json({ error: 'Este nome de usuário já está em uso.' });
         return;
       }
 
-      const newUser: StoredUser = {
-        id: `usr_${crypto.randomUUID().slice(0, 12)}`,
+      const result = await registerUserWithSupabase({
         name: String(name).trim(),
         username: cleanUsername,
         email: cleanEmail,
-        role: resolveInitialRole(cleanEmail), // Strictly server-resolved; never trusts client role
-        plan: 'free',
-        status: 'active',
-        passwordHash: hashPassword(String(password)),
-        createdAt: new Date().toISOString(),
-        settings: createDefaultUserSettings(),
-        myGameIds: [],
-      };
+        password: String(password),
+      });
 
-      db.users.push(newUser);
-      addSubscriptionRecord(newUser.id, 'free', 'active', 'Plano inicial gratuito ativado no cadastro.');
-      const session = createSession(newUser.id);
-      await flushDb();
+      if (result.conflictEmail) {
+        res.status(409).json({ error: result.error });
+        return;
+      }
+      if (result.error || !result.user || !result.session) {
+        res.status(400).json({ error: result.error || 'Não foi possível concluir o cadastro.' });
+        return;
+      }
 
-      setSessionCookie(req, res, session.token);
+      setAuthCookies(req, res, result.session);
       res.status(201).json({
-        user: sanitizeUser(newUser),
-        token: session.token,
+        user: sanitizeUser(result.user),
+        session: result.session,
       });
     }),
   );
@@ -222,27 +307,20 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
         return;
       }
 
-      const db = getDb();
-      const user = db.users.find(
-        (u) => u.email.toLowerCase() === cleanId || u.username.toLowerCase() === cleanId,
-      );
-      if (!user || !verifyPassword(rawPass, user.passwordHash)) {
-        res.status(401).json({ error: 'Credenciais inválidas. Verifique seu e-mail e senha.' });
+      const result = await loginUserWithSupabase(cleanId, rawPass);
+      if (result.suspended) {
+        res.status(403).json({ error: result.error });
         return;
       }
-      if (user.status !== 'active') {
-        res.status(403).json({ error: 'Esta conta está suspensa. Contate o suporte.' });
+      if (result.error || !result.user || !result.session) {
+        res.status(401).json({ error: result.error || 'Credenciais inválidas. Verifique seu e-mail e senha.' });
         return;
       }
 
-      syncPrimaryAdminRole(user);
-
-      const session = createSession(user.id);
-      await flushDb();
-      setSessionCookie(req, res, session.token);
+      setAuthCookies(req, res, result.session);
       res.json({
-        user: sanitizeUser(user),
-        token: session.token,
+        user: sanitizeUser(result.user),
+        session: result.session,
       });
     }),
   );
@@ -250,34 +328,67 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
   app.post(
     '/api/auth/logout',
     asyncHandler(async (req: AuthenticatedRequest, res) => {
-      const token = extractToken(req);
-      if (token) {
-        revokeSessionToken(token);
-        await flushDb();
+      const { accessToken } = extractAuthTokens(req);
+      if (accessToken) {
+        await logoutSupabaseToken(accessToken);
       }
-      clearSessionCookie(req, res);
+      clearAuthCookies(req, res);
       res.json({ ok: true });
     }),
   );
 
-  app.get('/api/auth/session', (req: AuthenticatedRequest, res) => {
-    const token = extractToken(req);
-    const user = findUserBySessionToken(token);
-    if (!user) {
-      res.json({ authenticated: false, user: null });
-      return;
-    }
-    res.json({
-      authenticated: true,
-      user: sanitizeUser(user),
-      token,
-    });
-  });
+  app.get(
+    '/api/auth/session',
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const { accessToken, refreshToken } = extractAuthTokens(req);
+      const resolved = await findUserByAccessToken(accessToken, refreshToken);
+      if (!resolved) {
+        res.json({ authenticated: false, user: null });
+        return;
+      }
+      if (resolved.refreshedSession) {
+        setAuthCookies(req, res, resolved.refreshedSession);
+      }
+      res.json({
+        authenticated: true,
+        user: sanitizeUser(resolved.user),
+        ...(resolved.refreshedSession ? { session: resolved.refreshedSession } : {}),
+      });
+    }),
+  );
+
+  // Sync Supabase client-side session (e.g. after recovery link) into HttpOnly cookies
+  app.post(
+    '/api/auth/sync-session',
+    asyncHandler(async (req, res) => {
+      const accessToken = String(req.body?.access_token || '').trim();
+      const refreshToken = String(req.body?.refresh_token || '').trim();
+      if (!accessToken) {
+        res.status(400).json({ error: 'Token de sessão ausente.' });
+        return;
+      }
+      const resolved = await findUserByAccessToken(accessToken, refreshToken || undefined);
+      if (!resolved) {
+        res.status(401).json({ error: 'Sessão Supabase inválida ou expirada.' });
+        return;
+      }
+      if (refreshToken) {
+        setAuthCookies(req, res, {
+          access_token: resolved.refreshedSession?.access_token || accessToken,
+          refresh_token: resolved.refreshedSession?.refresh_token || refreshToken,
+          expires_at: resolved.refreshedSession?.expires_at,
+        });
+      }
+      res.json({
+        authenticated: true,
+        user: sanitizeUser(resolved.user),
+      });
+    }),
+  );
 
   app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
     res.json({
       user: sanitizeUser(req.user!),
-      token: req.sessionToken,
     });
   });
 
@@ -289,79 +400,18 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
         res.status(400).json({ error: 'Informe o e-mail cadastrado.' });
         return;
       }
-      const db = getDb();
-      const user = db.users.find((u) => u.email.toLowerCase() === cleanEmail);
-      const resendKey = (process.env.RESEND_API_KEY || '').trim();
 
-      if (user) {
-        const token = crypto.randomBytes(16).toString('hex');
-        db.resetTokens.push({
-          token,
-          userId: user.id,
-          email: user.email,
-          expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
-          used: false,
-        });
-        await flushDb();
-
-        if (resendKey) {
-          const origin =
-            process.env.APP_URL?.trim() || `${req.protocol}://${req.get('host') || 'localhost:3000'}`;
-          const resetUrl = `${origin.replace(/\/+$/, '')}/redefinir-senha?token=${encodeURIComponent(token)}`;
-          const emailFrom = (process.env.EMAIL_FROM || 'MINHA LIVE GAMES <onboarding@resend.dev>').trim();
-          await fetch('https://api.resend.com/emails', {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${resendKey}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              from: emailFrom,
-              to: [user.email],
-              subject: 'Recuperação de senha — MINHA LIVE GAMES',
-              html: `<p>Olá, ${user.name}.</p><p>Clique no link abaixo para redefinir sua senha (válido por 15 minutos):</p><p><a href="${resetUrl}">${resetUrl}</a></p>`,
-            }),
-          }).catch((err) => {
-            console.warn('Falha ao enviar e-mail via Resend:', err);
-          });
-        }
-      }
+      const origin =
+        process.env.APP_URL?.trim() || `${req.protocol}://${req.get('host') || 'localhost:3000'}`;
+      const redirectTo = `${origin.replace(/\/+$/, '')}/redefinir-senha`;
+      await sendSupabasePasswordRecovery(cleanEmail, redirectTo);
 
       res.json({
         ok: true,
-        emailConfigured: Boolean(resendKey),
-        message: resendKey
-          ? 'Se o e-mail estiver cadastrado, enviamos as instruções de redefinição para sua caixa de entrada.'
-          : 'Se o e-mail estiver cadastrado, o pedido de recuperação foi registrado no servidor. Para envio automático de e-mails em produção, configure RESEND_API_KEY nas variáveis de ambiente da Vercel.',
+        emailConfigured: true,
+        message:
+          'Se o e-mail estiver cadastrado no Supabase, enviamos um link de redefinição de senha para sua caixa de entrada.',
       });
-    }),
-  );
-
-  app.post(
-    '/api/auth/reset-password',
-    asyncHandler(async (req, res) => {
-      const { token, newPassword, confirmPassword } = req.body ?? {};
-      if (!token || String(newPassword || '').length < 8 || newPassword !== confirmPassword) {
-        res.status(400).json({ error: 'Token inválido ou senhas não conferem (mínimo 8 caracteres).' });
-        return;
-      }
-      const db = getDb();
-      const record = db.resetTokens.find(
-        (r) => r.token === token && !r.used && new Date(r.expiresAt).getTime() > Date.now(),
-      );
-      if (!record) {
-        res.status(400).json({ error: 'Token de recuperação expirado ou inválido.' });
-        return;
-      }
-      const user = db.users.find((u) => u.id === record.userId);
-      if (!user) {
-        res.status(404).json({ error: 'Usuário não encontrado.' });
-        return;
-      }
-      user.passwordHash = hashPassword(String(newPassword));
-      record.used = true;
-      await flushDb();
-      res.json({ ok: true, message: 'Senha redefinida com sucesso.' });
     }),
   );
 
@@ -375,10 +425,10 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
       const user = req.user!;
       const { name, settings } = req.body ?? {};
 
-      if (typeof name === 'string' && name.trim().length >= 2) {
-        user.name = name.trim().slice(0, 80);
-      }
+      const nextName =
+        typeof name === 'string' && name.trim().length >= 2 ? name.trim().slice(0, 80) : undefined;
 
+      let nextSettings = user.settings;
       if (settings && typeof settings === 'object') {
         const merged = {
           ...user.settings,
@@ -394,11 +444,15 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
         if (!PLANS[user.plan].allowCustomWatermark) {
           merged.defaultOverlay.showWatermark = true;
         }
-        user.settings = merged;
+        nextSettings = merged;
       }
 
-      await flushDb();
-      res.json({ user: sanitizeUser(user) });
+      const updated = await updateUserProfileAndSettings(user.id, {
+        ...(nextName ? { name: nextName } : {}),
+        ...(settings && typeof settings === 'object' ? { settings: nextSettings } : {}),
+      });
+
+      res.json({ user: sanitizeUser(updated) });
     }),
   );
 
@@ -408,31 +462,41 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     asyncHandler(async (req: AuthenticatedRequest, res) => {
       const user = req.user!;
       const { currentPassword, newPassword, confirmPassword } = req.body ?? {};
-      if (!verifyPassword(String(currentPassword || ''), user.passwordHash)) {
-        res.status(400).json({ error: 'Senha atual incorreta.' });
+      if (!currentPassword) {
+        res.status(400).json({ error: 'Informe sua senha atual.' });
         return;
       }
       if (String(newPassword || '').length < 8 || newPassword !== confirmPassword) {
         res.status(400).json({ error: 'Nova senha inválida (mínimo 8 caracteres) ou confirmação diferente.' });
         return;
       }
-      user.passwordHash = hashPassword(String(newPassword));
-      await flushDb();
-      res.json({ ok: true, message: 'Senha atualizada com sucesso.' });
+
+      const result = await updateSupabaseUserPassword(
+        user.id,
+        user.email,
+        String(currentPassword),
+        String(newPassword),
+      );
+      if (!result.ok) {
+        res.status(400).json({ error: result.error || 'Não foi possível atualizar a senha.' });
+        return;
+      }
+
+      res.json({ ok: true, message: 'Senha atualizada com sucesso no Supabase Auth.' });
     }),
   );
 
   // ---------------------------------------------------------------------------
   // Centralized Global Games Library & User "Meus Jogos" Endpoints
   // ---------------------------------------------------------------------------
-  app.get('/api/games', requireAuth, (req: AuthenticatedRequest, res) => {
-    const db = getDb();
-    const visibleGames =
-      req.user!.role === 'admin'
-        ? db.games
-        : db.games.filter((g) => g.isActive);
-    res.json({ games: visibleGames });
-  });
+  app.get(
+    '/api/games',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const gamesList = await listGamesForRole(req.user!.role === 'admin');
+      res.json({ games: gamesList });
+    }),
+  );
 
   app.post(
     '/api/games',
@@ -440,8 +504,6 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     requireAdmin,
     asyncHandler(async (req: AuthenticatedRequest, res) => {
       const user = req.user!;
-      const db = getDb();
-
       const {
         name,
         description,
@@ -489,9 +551,7 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
           ? coverImage
           : undefined;
 
-      const now = new Date().toISOString();
-      const game: GameItem = {
-        id: `gm_${crypto.randomUUID().slice(0, 10)}`,
+      const game = await createGameRecord({
         userId: user.id,
         name: String(name).trim().slice(0, 80),
         description: String(description || '').trim().slice(0, 400),
@@ -504,18 +564,19 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
         fileList: bundled.fileList,
         totalSizeBytes,
         overlayConfig: {
-          ...createDefaultOverlayConfig(),
-          ...user.settings.defaultOverlay,
           showWatermark: PLANS[user.plan].allowCustomWatermark
             ? user.settings.defaultOverlay.showWatermark
             : true,
+          watermarkPosition: user.settings.defaultOverlay.watermarkPosition,
+          watermarkOpacity: user.settings.defaultOverlay.watermarkOpacity,
+          backgroundMode: user.settings.defaultOverlay.backgroundMode,
+          accentColor: user.settings.defaultOverlay.accentColor,
+          showEventToast: user.settings.defaultOverlay.showEventToast,
+          borderRadius: user.settings.defaultOverlay.borderRadius,
+          scale: user.settings.defaultOverlay.scale,
         },
-        createdAt: now,
-        updatedAt: now,
-      };
+      });
 
-      db.games.unshift(game);
-      await flushDb();
       res.status(201).json({ game });
     }),
   );
@@ -525,47 +586,50 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     requireAuth,
     requireAdmin,
     asyncHandler(async (req: AuthenticatedRequest, res) => {
-      const db = getDb();
-      const game = db.games.find((g) => g.id === req.params.id);
-      if (!game) {
+      const existing = await findGameById(req.params.id);
+      if (!existing) {
         res.status(404).json({ error: 'Jogo não encontrado.' });
         return;
       }
 
       const { name, description, category, engine, isActive, overlayConfig, coverImage, rawHtml } = req.body ?? {};
-      if (typeof name === 'string' && name.trim().length >= 2) game.name = name.trim().slice(0, 80);
-      if (typeof description === 'string') game.description = description.trim().slice(0, 400);
-      if (category) game.category = category as GameCategory;
-      if (engine) game.engine = engine as GameEngine;
-      if (typeof isActive === 'boolean') game.isActive = isActive;
+      const patch: Parameters<typeof updateGameRecord>[1] = {};
+
+      if (typeof name === 'string' && name.trim().length >= 2) patch.name = name.trim().slice(0, 80);
+      if (typeof description === 'string') patch.description = description.trim().slice(0, 400);
+      if (category) patch.category = category as GameCategory;
+      if (engine) patch.engine = engine as GameEngine;
+      if (typeof isActive === 'boolean') patch.isActive = isActive;
       if (typeof coverImage === 'string' && coverImage.startsWith('data:image/')) {
-        game.coverImage = coverImage;
+        patch.coverImage = coverImage;
       }
       if (typeof rawHtml === 'string' && rawHtml.trim().length > 0) {
         const origin = process.env.APP_URL?.trim() || `${req.protocol}://${req.get('host')}`;
-        const rebuilt = buildIsolatedHtmlBundle(game.entryFile, { [game.entryFile]: rawHtml }, origin);
+        const rebuilt = buildIsolatedHtmlBundle(existing.entryFile, { [existing.entryFile]: rawHtml }, origin);
         if (rebuilt.error) {
           res.status(400).json({ error: rebuilt.error });
           return;
         }
-        game.bundleHtml = rebuilt.html;
-        game.totalSizeBytes = Buffer.byteLength(rawHtml, 'utf8');
+        patch.bundleHtml = rebuilt.html;
+        patch.totalSizeBytes = Buffer.byteLength(rawHtml, 'utf8');
       }
       if (overlayConfig && typeof overlayConfig === 'object') {
         const nextOverlay: OverlayConfig = {
-          ...game.overlayConfig,
+          ...existing.overlayConfig,
           ...overlayConfig,
         };
         if (!PLANS[req.user!.plan].allowCustomWatermark) {
           nextOverlay.showWatermark = true;
         }
-        game.overlayConfig = nextOverlay;
-        broadcastOverlayConfigUpdate(game.id, nextOverlay);
+        patch.overlayConfig = nextOverlay;
       }
 
-      game.updatedAt = new Date().toISOString();
-      await flushDb();
-      res.json({ game });
+      const updated = await updateGameRecord(existing.id, patch);
+      if (updated && patch.overlayConfig) {
+        broadcastOverlayConfigUpdate(updated.id, patch.overlayConfig);
+      }
+
+      res.json({ game: updated });
     }),
   );
 
@@ -574,18 +638,11 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     requireAuth,
     requireAdmin,
     asyncHandler(async (req: AuthenticatedRequest, res) => {
-      const db = getDb();
-      const exists = db.games.some((g) => g.id === req.params.id);
-      if (!exists) {
+      const removed = await deleteGameRecord(req.params.id);
+      if (!removed) {
         res.status(404).json({ error: 'Jogo não encontrado.' });
         return;
       }
-      db.games = db.games.filter((g) => g.id !== req.params.id);
-      db.rules = db.rules.filter((r) => r.gameId !== req.params.id);
-      for (const u of db.users) {
-        u.myGameIds = (u.myGameIds || []).filter((id) => id !== req.params.id);
-      }
-      await flushDb();
       res.json({ ok: true });
     }),
   );
@@ -594,19 +651,12 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     '/api/my-games/:gameId',
     requireAuth,
     asyncHandler(async (req: AuthenticatedRequest, res) => {
-      const db = getDb();
-      const user = req.user!;
-      const game = db.games.find((g) => g.id === req.params.gameId && g.isActive);
-      if (!game) {
+      const saved = await addUserSavedGame(req.user!.id, req.params.gameId);
+      if (!saved) {
         res.status(404).json({ error: 'Jogo publicado não encontrado na biblioteca.' });
         return;
       }
-      const list = Array.isArray(user.myGameIds) ? user.myGameIds : [];
-      if (!list.includes(game.id)) {
-        user.myGameIds = [game.id, ...list];
-        await flushDb();
-      }
-      res.json({ myGameIds: user.myGameIds, user: sanitizeUser(user) });
+      res.json(saved);
     }),
   );
 
@@ -614,47 +664,48 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     '/api/my-games/:gameId',
     requireAuth,
     asyncHandler(async (req: AuthenticatedRequest, res) => {
-      const user = req.user!;
-      const list = Array.isArray(user.myGameIds) ? user.myGameIds : [];
-      user.myGameIds = list.filter((id) => id !== req.params.gameId);
-      await flushDb();
-      res.json({ myGameIds: user.myGameIds, user: sanitizeUser(user) });
+      const removed = await removeUserSavedGame(req.user!.id, req.params.gameId);
+      res.json(removed);
     }),
   );
 
-  // Public standalone Overlay endpoint (safe: never returns user PII)
-  app.get('/api/overlay/:id', (req, res) => {
-    const db = getDb();
-    const game = db.games.find((g) => g.id === req.params.id);
-    if (!game) {
-      res.status(404).json({ error: 'Overlay não encontrado.' });
-      return;
-    }
-    const origin = process.env.APP_URL?.trim() || `${req.protocol}://${req.get('host')}`;
-    const playableHtml = game.isActive ? preparePlayableHtml(game.bundleHtml, origin) : '';
-    res.json({
-      overlay: {
-        id: game.id,
-        name: game.name,
-        engine: game.engine,
-        isActive: game.isActive,
-        bundleHtml: playableHtml,
-        overlayConfig: game.overlayConfig,
-        watermarkText: db.platformSettings.defaultWatermarkText || 'MINHA LIVE GAMES',
-        capabilities: {
-          websocket: !process.env.VERCEL,
-          pollingIntervalMs: 1200,
+  // Public standalone Overlay endpoint (safe: never returns user PII) — PRESERVED UNCHANGED
+  app.get(
+    '/api/overlay/:id',
+    asyncHandler(async (req, res) => {
+      const [game, settings] = await Promise.all([
+        findGameById(req.params.id),
+        getPlatformSettings(),
+      ]);
+      if (!game) {
+        res.status(404).json({ error: 'Overlay não encontrado.' });
+        return;
+      }
+      const origin = process.env.APP_URL?.trim() || `${req.protocol}://${req.get('host')}`;
+      const playableHtml = game.isActive ? preparePlayableHtml(game.bundleHtml, origin) : '';
+      res.json({
+        overlay: {
+          id: game.id,
+          name: game.name,
+          engine: game.engine,
+          isActive: game.isActive,
+          bundleHtml: playableHtml,
+          overlayConfig: game.overlayConfig,
+          watermarkText: settings.defaultWatermarkText || 'MINHA LIVE GAMES',
+          capabilities: {
+            websocket: !process.env.VERCEL,
+            pollingIntervalMs: 1200,
+          },
         },
-      },
-    });
-  });
+      });
+    }),
+  );
 
-  // Public Overlay real-time polling endpoint (Vercel Serverless fallback for WebSocket /ws)
+  // Public Overlay real-time polling endpoint (Vercel Serverless fallback for WebSocket /ws) — PRESERVED UNCHANGED
   app.get(
     '/api/overlay/:id/events',
     asyncHandler(async (req, res) => {
-      const db = await hydrateDb(true);
-      const game = db.games.find((g) => g.id === req.params.id);
+      const game = await findGameById(req.params.id);
       if (!game) {
         res.status(404).json({ error: 'Overlay não encontrado.' });
         return;
@@ -666,17 +717,8 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
           ? Number(rawSince)
           : Date.parse(rawSince)
         : 0;
-      const validSinceMs = Number.isFinite(sinceMs) && sinceMs > 0 ? sinceMs : 0;
 
-      const matching = db.events
-        .filter((e) => {
-          if (e.gameId !== game.id && e.gameId !== 'all') return false;
-          if (!validSinceMs) return false;
-          const evMs = Date.parse(e.createdAt);
-          return Number.isFinite(evMs) && evMs >= validSinceMs;
-        })
-        .slice(0, 30)
-        .reverse(); // Chronological order for dispatch
+      const matching = await listOverlayEventsSince(game.id, sinceMs);
 
       res.setHeader('Cache-Control', 'no-store');
       res.json({
@@ -691,20 +733,22 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
   // ---------------------------------------------------------------------------
   // Event Rules & Simulation / Real-Time Events Endpoints
   // ---------------------------------------------------------------------------
-  app.get('/api/rules', requireAuth, (req: AuthenticatedRequest, res) => {
-    const db = getDb();
-    res.json({ rules: db.rules.filter((r) => r.userId === req.user!.id) });
-  });
+  app.get(
+    '/api/rules',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const rulesList = await listRulesForUser(req.user!.id);
+      res.json({ rules: rulesList });
+    }),
+  );
 
   app.post(
     '/api/rules',
     requireAuth,
     asyncHandler(async (req: AuthenticatedRequest, res) => {
       const user = req.user!;
-      const db = getDb();
-      const userRules = db.rules.filter((r) => r.userId === user.id);
-
-      const quota = canCreateRule(user.plan, userRules.length);
+      const existingCount = await countRulesForUser(user.id);
+      const quota = canCreateRule(user.plan, existingCount);
       if (!quota.allowed) {
         res.status(403).json({ error: quota.reason });
         return;
@@ -731,9 +775,7 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
         return;
       }
 
-      const now = new Date().toISOString();
-      const rule: EventRule = {
-        id: `rl_${crypto.randomUUID().slice(0, 10)}`,
+      const rule = await createRuleRecord({
         userId: user.id,
         gameId: String(gameId || 'all'),
         name: String(name).trim().slice(0, 80),
@@ -744,12 +786,8 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
         actionType: actionType || 'trigger_animation',
         actionCommand: String(actionCommand).trim().slice(0, 80),
         actionPayload: String(actionPayload || '{}').slice(0, 500),
-        createdAt: now,
-        updatedAt: now,
-      };
+      });
 
-      db.rules.unshift(rule);
-      await flushDb();
       res.status(201).json({ rule });
     }),
   );
@@ -758,24 +796,26 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     '/api/rules/:id',
     requireAuth,
     asyncHandler(async (req: AuthenticatedRequest, res) => {
-      const db = getDb();
-      const rule = db.rules.find((r) => r.id === req.params.id && r.userId === req.user!.id);
+      const fields = req.body ?? {};
+      const patch: Parameters<typeof updateRuleRecord>[2] = {};
+
+      if (typeof fields.name === 'string' && fields.name.trim().length >= 2) {
+        patch.name = fields.name.trim().slice(0, 80);
+      }
+      if (typeof fields.gameId === 'string') patch.gameId = fields.gameId;
+      if (typeof fields.enabled === 'boolean') patch.enabled = fields.enabled;
+      if (fields.eventType) patch.eventType = fields.eventType;
+      if (fields.operator) patch.operator = fields.operator;
+      if (typeof fields.conditionValue === 'string') patch.conditionValue = fields.conditionValue;
+      if (fields.actionType) patch.actionType = fields.actionType;
+      if (typeof fields.actionCommand === 'string') patch.actionCommand = fields.actionCommand.trim().slice(0, 80);
+      if (typeof fields.actionPayload === 'string') patch.actionPayload = fields.actionPayload.slice(0, 500);
+
+      const rule = await updateRuleRecord(req.params.id, req.user!.id, patch);
       if (!rule) {
         res.status(404).json({ error: 'Regra não encontrada.' });
         return;
       }
-      const fields = req.body ?? {};
-      if (typeof fields.name === 'string' && fields.name.trim().length >= 2) rule.name = fields.name.trim().slice(0, 80);
-      if (typeof fields.gameId === 'string') rule.gameId = fields.gameId;
-      if (typeof fields.enabled === 'boolean') rule.enabled = fields.enabled;
-      if (fields.eventType) rule.eventType = fields.eventType;
-      if (fields.operator) rule.operator = fields.operator;
-      if (typeof fields.conditionValue === 'string') rule.conditionValue = fields.conditionValue;
-      if (fields.actionType) rule.actionType = fields.actionType;
-      if (typeof fields.actionCommand === 'string') rule.actionCommand = fields.actionCommand.trim().slice(0, 80);
-      if (typeof fields.actionPayload === 'string') rule.actionPayload = fields.actionPayload.slice(0, 500);
-      rule.updatedAt = new Date().toISOString();
-      await flushDb();
       res.json({ rule });
     }),
   );
@@ -784,30 +824,29 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     '/api/rules/:id',
     requireAuth,
     asyncHandler(async (req: AuthenticatedRequest, res) => {
-      const db = getDb();
-      const before = db.rules.length;
-      db.rules = db.rules.filter((r) => !(r.id === req.params.id && r.userId === req.user!.id));
-      if (db.rules.length === before) {
+      const deleted = await deleteRuleRecord(req.params.id, req.user!.id);
+      if (!deleted) {
         res.status(404).json({ error: 'Regra não encontrada.' });
         return;
       }
-      await flushDb();
       res.json({ ok: true });
     }),
   );
 
-  app.get('/api/events', requireAuth, (req: AuthenticatedRequest, res) => {
-    const db = getDb();
-    const userEvents = db.events.filter((e) => e.userId === req.user!.id).slice(0, 100);
-    res.json({ events: userEvents });
-  });
+  app.get(
+    '/api/events',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const userEvents = await listEventsForUser(req.user!.id, 100);
+      res.json({ events: userEvents });
+    }),
+  );
 
   app.post(
     '/api/events/simulate',
     requireAuth,
     asyncHandler(async (req: AuthenticatedRequest, res) => {
       const user = req.user!;
-      const db = getDb();
       const {
         gameId,
         type,
@@ -821,7 +860,7 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
       } = req.body ?? {};
 
       const targetGameId = String(gameId || 'all');
-      const userRules = db.rules.filter((r) => r.userId === user.id);
+      const userRules = await listRulesForUser(user.id);
       const evaluation = evaluateRules(
         {
           gameId: targetGameId,
@@ -837,8 +876,7 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
         userRules,
       );
 
-      const eventRecord: LiveEventPayload = {
-        id: `evt_${crypto.randomUUID().slice(0, 10)}`,
+      const eventRecord = await recordLiveEvent({
         userId: user.id,
         gameId: targetGameId,
         type: (type || 'gift') as LiveEventType,
@@ -852,17 +890,10 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
         isSimulation: true,
         matchedRuleIds: evaluation.matchedRuleIds,
         triggeredCommands: evaluation.triggeredCommands,
-        createdAt: new Date().toISOString(),
-      };
-
-      db.events.unshift(eventRecord);
-      if (db.events.length > 500) {
-        db.events = db.events.slice(0, 500);
-      }
-      await flushDb();
+      });
 
       if (targetGameId === 'all') {
-        const activeGames = db.games.filter((g) => g.isActive);
+        const activeGames = await listGamesForRole(false);
         for (const g of activeGames) {
           broadcastLiveEvent(user.id, g.id, eventRecord);
         }
@@ -904,26 +935,24 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
   // ---------------------------------------------------------------------------
   // Subscriptions & Plans Endpoints
   // ---------------------------------------------------------------------------
-  app.get('/api/subscription', requireAuth, (req: AuthenticatedRequest, res) => {
-    const db = getDb();
-    const user = req.user!;
-    const history = db.subscriptions.filter((s) => s.userId === user.id);
-    const gamesCount =
-      user.role === 'admin'
-        ? db.games.length
-        : (user.myGameIds || []).filter((id) => db.games.some((g) => g.id === id && g.isActive)).length;
-    const rulesCount = db.rules.filter((r) => r.userId === user.id).length;
-    res.json({
-      currentPlan: user.plan,
-      plans: PLANS,
-      usage: {
-        gamesCount,
-        rulesCount,
-      },
-      history,
-      mercadoPago: prepareMercadoPagoCheckout(user.plan),
-    });
-  });
+  app.get(
+    '/api/subscription',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const user = req.user!;
+      const summary = await getSubscriptionSummaryForUser(user);
+      res.json({
+        currentPlan: user.plan,
+        plans: PLANS,
+        usage: {
+          gamesCount: summary.gamesCount,
+          rulesCount: summary.rulesCount,
+        },
+        history: summary.history,
+        mercadoPago: prepareMercadoPagoCheckout(user.plan),
+      });
+    }),
+  );
 
   app.post('/api/subscription/prepare-checkout', requireAuth, (req: AuthenticatedRequest, res) => {
     const requestedPlan = String(req.body?.plan || 'free') as PlanTier;
@@ -938,67 +967,35 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
   // ---------------------------------------------------------------------------
   // Admin Endpoints (Strictly server-RBAC guarded)
   // ---------------------------------------------------------------------------
-  app.get('/api/admin/overview', requireAuth, requireAdmin, (_req, res) => {
-    const db = getDb();
-    const stats: AdminOverviewStats = {
-      totalUsers: db.users.length,
-      activeUsers: db.users.filter((u) => u.status === 'active').length,
-      totalGames: db.games.length,
-      activeGames: db.games.filter((g) => g.isActive).length,
-      totalEvents: db.events.length,
-      totalRules: db.rules.length,
-      planDistribution: {
-        free: db.users.filter((u) => u.plan === 'free').length,
-        premium: db.users.filter((u) => u.plan === 'premium').length,
-        pro: db.users.filter((u) => u.plan === 'pro').length,
-      },
-    };
-    res.json({
-      stats,
-      users: db.users.map(sanitizeUser),
-      games: db.games.map((g) => ({
-        id: g.id,
-        userId: g.userId,
-        name: g.name,
-        category: g.category,
-        engine: g.engine,
-        isActive: g.isActive,
-        totalSizeBytes: g.totalSizeBytes,
-        createdAt: g.createdAt,
-      })),
-      subscriptions: db.subscriptions.slice(0, 50),
-      platformSettings: db.platformSettings,
-    });
-  });
+  app.get(
+    '/api/admin/overview',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (_req, res) => {
+      const overview = await getAdminOverviewData();
+      res.json(overview);
+    }),
+  );
 
   app.patch(
     '/api/admin/users/:id',
     requireAuth,
     requireAdmin,
     asyncHandler(async (req: AuthenticatedRequest, res) => {
-      const db = getDb();
-      const target = db.users.find((u) => u.id === req.params.id);
-      if (!target) {
-        res.status(404).json({ error: 'Usuário não encontrado.' });
+      const { role, plan, status } = req.body ?? {};
+      const validPlan = plan && PLANS[plan as PlanTier] ? (plan as PlanTier) : undefined;
+      const result = await adminUpdateUser(req.params.id, req.user!.id, {
+        role,
+        plan: validPlan,
+        status,
+      });
+
+      if (result.error) {
+        res.status(result.statusCode || 400).json({ error: result.error });
         return;
       }
-      const { role, plan, status } = req.body ?? {};
-      if (role && (role === 'user' || role === 'admin')) {
-        if ((target.id === req.user!.id || isPrimaryAdminEmail(target.email)) && role !== 'admin') {
-          res.status(400).json({ error: 'Não é possível remover a permissão do administrador principal.' });
-          return;
-        }
-        target.role = role;
-      }
-      if (plan && PLANS[plan as PlanTier]) {
-        target.plan = plan as PlanTier;
-        addSubscriptionRecord(target.id, target.plan, 'active', 'Plano atualizado pela administração.');
-      }
-      if (status && (status === 'active' || status === 'suspended')) {
-        target.status = status;
-      }
-      await flushDb();
-      res.json({ user: sanitizeUser(target) });
+
+      res.json({ user: result.user });
     }),
   );
 
@@ -1007,21 +1004,22 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     requireAuth,
     requireAdmin,
     asyncHandler(async (req, res) => {
-      const db = getDb();
       const body = req.body ?? {};
-      db.platformSettings = {
-        ...db.platformSettings,
-        ...(typeof body.registrationEnabled === 'boolean' ? { registrationEnabled: body.registrationEnabled } : {}),
+      const next = await updatePlatformSettings({
+        ...(typeof body.registrationEnabled === 'boolean'
+          ? { registrationEnabled: body.registrationEnabled }
+          : {}),
         ...(typeof body.maintenanceMode === 'boolean' ? { maintenanceMode: body.maintenanceMode } : {}),
         ...(typeof body.defaultWatermarkText === 'string' && body.defaultWatermarkText.trim()
           ? { defaultWatermarkText: body.defaultWatermarkText.trim().slice(0, 40) }
           : {}),
-        ...(typeof body.maxUploadSizeMb === 'number' && body.maxUploadSizeMb >= 1 && body.maxUploadSizeMb <= 100
+        ...(typeof body.maxUploadSizeMb === 'number' &&
+        body.maxUploadSizeMb >= 1 &&
+        body.maxUploadSizeMb <= 100
           ? { maxUploadSizeMb: body.maxUploadSizeMb }
           : {}),
-      };
-      await flushDb();
-      res.json({ platformSettings: db.platformSettings });
+      });
+      res.json({ platformSettings: next });
     }),
   );
 

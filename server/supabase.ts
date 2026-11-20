@@ -40,16 +40,19 @@ export function getSupabaseEnvConfig(): SupabaseEnvConfig {
   const anonKey = (
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
     process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY ||
     process.env.VITE_SUPABASE_ANON_KEY ||
     process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
     process.env.SUPABASE_ANON_KEY ||
     process.env.SUPABASE_PUBLISHABLE_KEY ||
+    process.env.SUPABASE_PUBLISHABLE_DEFAULT_KEY ||
     ''
   ).trim();
 
   const serviceRoleKey = (
     process.env.SUPABASE_SERVICE_ROLE_KEY ||
     process.env.SUPABASE_SECRET_KEY ||
+    process.env.SUPABASE_SERVICE_KEY ||
     ''
   ).trim();
 
@@ -60,6 +63,12 @@ export function getSupabaseEnvConfig(): SupabaseEnvConfig {
     publicKeyMode: classifySupabaseKey(anonKey),
     secretKeyMode: classifySupabaseKey(serviceRoleKey),
   };
+}
+
+export function getPublicSupabaseConfig(): { url: string; publishableKey: string } | null {
+  const { url, anonKey } = getSupabaseEnvConfig();
+  if (!url || !isValidPublicSupabaseKey(anonKey)) return null;
+  return { url, publishableKey: anonKey };
 }
 
 export function getMissingSupabaseEnvVars(): string[] {

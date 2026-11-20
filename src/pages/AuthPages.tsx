@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { ArrowLeft, AlertCircle, CheckCircle2 } from 'lucide-react';
 import { BrandLogo } from '../components/BrandMark';
 import { useAuth } from '../context/AuthContext';
-import { getBrowserSupabaseClient } from '../lib/supabase';
+import { ensureBrowserSupabaseClient } from '../lib/supabase';
 import { validateRegistrationInput } from '../lib/validation';
 import { apiRequest } from '../services/api';
 
@@ -37,25 +37,26 @@ export function AuthPages({ mode, onNavigate }: AuthPagesProps) {
     }
 
     let cancelled = false;
+    let unsubscribe: (() => void) | undefined;
     setCheckingRecovery(true);
-
-    const supabase = getBrowserSupabaseClient();
-    if (!supabase) {
-      setRecoveryReady(false);
-      setCheckingRecovery(false);
-      return;
-    }
-
-    const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
-      if (cancelled) return;
-      if (event === 'PASSWORD_RECOVERY' || (event === 'SIGNED_IN' && session)) {
-        setRecoveryReady(true);
-        setCheckingRecovery(false);
-      }
-    });
 
     const resolveSession = async () => {
       try {
+        const supabase = await ensureBrowserSupabaseClient();
+        if (!supabase || cancelled) {
+          if (!cancelled) setRecoveryReady(false);
+          return;
+        }
+
+        const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
+          if (cancelled) return;
+          if (event === 'PASSWORD_RECOVERY' || (event === 'SIGNED_IN' && session)) {
+            setRecoveryReady(true);
+            setCheckingRecovery(false);
+          }
+        });
+        unsubscribe = () => listener.subscription.unsubscribe();
+
         const params = new URLSearchParams(window.location.search);
         const code = params.get('code');
         if (code) {
@@ -80,7 +81,7 @@ export function AuthPages({ mode, onNavigate }: AuthPagesProps) {
 
     return () => {
       cancelled = true;
-      listener.subscription.unsubscribe();
+      unsubscribe?.();
     };
   }, [mode]);
 
@@ -164,7 +165,7 @@ export function AuthPages({ mode, onNavigate }: AuthPagesProps) {
       return;
     }
 
-    const supabase = getBrowserSupabaseClient();
+    const supabase = await ensureBrowserSupabaseClient();
     if (!supabase) {
       setError('Cliente Supabase não configurado no navegador.');
       return;

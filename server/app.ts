@@ -78,6 +78,7 @@ import {
 } from './store.js';
 import {
   getMissingSupabaseEnvVars,
+  getPublicSupabaseConfig,
   getSupabaseConfigIssues,
   getSupabaseEnvConfig,
   isSupabaseConfigured,
@@ -393,13 +394,26 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     }),
   );
 
+  app.get('/api/public-config', (_req, res) => {
+    const publicSupabase = getPublicSupabaseConfig();
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      configured: isSupabaseConfigured(),
+      supabase: publicSupabase,
+    });
+  });
+
   // Guard auth/data API calls with clear 503 if Supabase env vars are missing or invalid
   app.use('/api', (req: Request, res: Response, next: NextFunction) => {
-    if (req.path === '/health') {
+    if (req.path === '/health' || req.path === '/public-config') {
       next();
       return;
     }
     if (!isSupabaseConfigured()) {
+      if (req.path === '/auth/session' && req.method === 'GET') {
+        res.json({ authenticated: false, user: null, unconfigured: true });
+        return;
+      }
       const missing = getMissingSupabaseEnvVars();
       const issues = getSupabaseConfigIssues();
       res.status(503).json({

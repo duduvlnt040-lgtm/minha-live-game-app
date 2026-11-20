@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import { getBrowserSupabaseClient } from '../lib/supabase';
+import { ensureBrowserSupabaseClient, getBrowserSupabaseClient } from '../lib/supabase';
 import { apiRequest } from '../services/api';
 import type { UserProfile, UserSettings } from '../types/platform';
 
@@ -31,7 +31,7 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 async function syncBrowserSupabaseSession(session?: SessionTokens | null): Promise<void> {
   if (!session?.access_token || !session?.refresh_token) return;
   try {
-    const supabase = getBrowserSupabaseClient();
+    const supabase = await ensureBrowserSupabaseClient();
     if (!supabase) return;
     await supabase.auth.setSession({
       access_token: session.access_token,
@@ -68,27 +68,32 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     void refreshUser();
 
-    const supabase = getBrowserSupabaseClient();
-    if (!supabase) return;
+    let active = true;
+    let unsubscribe: (() => void) | undefined;
 
-    const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
-      if (event === 'SIGNED_OUT') {
-        setUser(null);
-        return;
-      }
-      if (event === 'TOKEN_REFRESHED' && session?.access_token && session?.refresh_token) {
-        void apiRequest('/api/auth/sync-session', {
-          method: 'POST',
-          body: JSON.stringify({
-            access_token: session.access_token,
-            refresh_token: session.refresh_token,
-          }),
-        }).catch(() => {});
-      }
+    void ensureBrowserSupabaseClient().then((supabase) => {
+      if (!active || !supabase) return;
+      const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
+        if (event === 'SIGNED_OUT') {
+          setUser(null);
+          return;
+        }
+        if (event === 'TOKEN_REFRESHED' && session?.access_token && session?.refresh_token) {
+          void apiRequest('/api/auth/sync-session', {
+            method: 'POST',
+            body: JSON.stringify({
+              access_token: session.access_token,
+              refresh_token: session.refresh_token,
+            }),
+          }).catch(() => {});
+        }
+      });
+      unsubscribe = () => listener.subscription.unsubscribe();
     });
 
     return () => {
-      listener.subscription.unsubscribe();
+      active = false;
+      unsubscribe?.();
     };
   }, [refreshUser]);
 

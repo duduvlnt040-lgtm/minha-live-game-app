@@ -9,8 +9,11 @@ export interface IncomingLiveStreamEvent {
   likeCount?: number;
 }
 
+export type LiveEventHandler = (userId: string, event: IncomingLiveStreamEvent) => void | Promise<void>;
+
 export interface LiveStreamProvider {
   readonly providerName: string;
+  setEventCallback(handler: LiveEventHandler): void;
   getStatus(userId: string): TikTokIntegrationStatus;
   connect(userId: string, username: string): Promise<TikTokIntegrationStatus>;
   disconnect(userId: string): Promise<TikTokIntegrationStatus>;
@@ -23,6 +26,20 @@ class ModularTikTokLiveProvider implements LiveStreamProvider {
   readonly providerName = 'TikTok LIVE Adapter (Desacoplado)';
   private states = new Map<string, TikTokIntegrationStatus>();
   private activeConnectors = new Map<string, { disconnect?: () => void }>();
+  private eventHandler: LiveEventHandler | null = null;
+
+  setEventCallback(handler: LiveEventHandler): void {
+    this.eventHandler = handler;
+  }
+
+  private emitIncomingEvent(userId: string, payload: IncomingLiveStreamEvent): void {
+    this.recordEvent(userId);
+    if (this.eventHandler) {
+      Promise.resolve(this.eventHandler(userId, payload)).catch((err) => {
+        console.warn('Erro ao processar evento TikTok LIVE recebido:', err);
+      });
+    }
+  }
 
   private defaultState(): TikTokIntegrationStatus {
     return {
@@ -60,6 +77,9 @@ class ModularTikTokLiveProvider implements LiveStreamProvider {
       return errState;
     }
 
+    // Disconnect previous connector for this user if present
+    await this.disconnect(userId);
+
     // Attempt optional dynamic load of community library 'tiktok-live-connector' if user installs it.
     // Never fabricate a fake connected state when the connector or active live room is absent.
     try {
@@ -80,6 +100,73 @@ class ModularTikTokLiveProvider implements LiveStreamProvider {
       const connection = new mod.WebcastPushConnection(cleanHandle, {
         processInitialData: false,
       });
+
+      if (typeof connection.on === 'function') {
+        connection.on('gift', (data: Record<string, unknown>) => {
+          const giftName = String(data?.giftName || data?.describe || 'Presente');
+          const count = Math.max(1, Number(data?.repeatCount || data?.giftCount || 1));
+          const sender = String(data?.uniqueId || data?.nickname || 'espectador');
+          // Wait until streak ends when giftType === 1 & repeatEnd === false to avoid duplicate fire
+          if (data?.giftType === 1 && data?.repeatEnd === false) return;
+          this.emitIncomingEvent(userId, {
+            type: 'gift',
+            senderUsername: sender,
+            giftName,
+            giftCount: count,
+          });
+        });
+
+        connection.on('chat', (data: Record<string, unknown>) => {
+          const sender = String(data?.uniqueId || data?.nickname || 'espectador');
+          const commentText = String(data?.comment || '');
+          this.emitIncomingEvent(userId, {
+            type: 'comment',
+            senderUsername: sender,
+            commentText,
+          });
+        });
+
+        connection.on('like', (data: Record<string, unknown>) => {
+          const sender = String(data?.uniqueId || data?.nickname || 'espectador');
+          const likeCount = Math.max(1, Number(data?.likeCount || 1));
+          this.emitIncomingEvent(userId, {
+            type: 'like',
+            senderUsername: sender,
+            likeCount,
+          });
+        });
+
+        connection.on('follow', (data: Record<string, unknown>) => {
+          const sender = String(data?.uniqueId || data?.nickname || 'espectador');
+          this.emitIncomingEvent(userId, {
+            type: 'follow',
+            senderUsername: sender,
+          });
+        });
+
+        connection.on('share', (data: Record<string, unknown>) => {
+          const sender = String(data?.uniqueId || data?.nickname || 'espectador');
+          this.emitIncomingEvent(userId, {
+            type: 'share',
+            senderUsername: sender,
+          });
+        });
+
+        connection.on('streamEnd', () => {
+          this.activeConnectors.delete(userId);
+          this.states.set(userId, {
+            ...this.defaultState(),
+            status: 'disconnected',
+            connectedUsername: null,
+            lastError: `A live de @${cleanHandle} foi encerrada.`,
+          });
+        });
+
+        connection.on('disconnected', () => {
+          this.activeConnectors.delete(userId);
+        });
+      }
+
       await connection.connect();
       this.activeConnectors.set(userId, connection);
       const connectedState: TikTokIntegrationStatus = {

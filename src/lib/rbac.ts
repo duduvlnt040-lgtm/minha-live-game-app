@@ -12,7 +12,8 @@ export type DashboardTab =
   | 'settings'
   | 'subscription'
   | 'account'
-  | 'admin';
+  | 'admin'
+  | 'admin-music';
 
 export const ADMIN_ALLOWED_TABS: DashboardTab[] = [
   'overview',
@@ -27,6 +28,7 @@ export const ADMIN_ALLOWED_TABS: DashboardTab[] = [
   'subscription',
   'account',
   'admin',
+  'admin-music',
 ];
 
 export const USER_ALLOWED_TABS: DashboardTab[] = [

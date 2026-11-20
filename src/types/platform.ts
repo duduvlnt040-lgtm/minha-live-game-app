@@ -165,3 +165,123 @@ export interface AdminOverviewStats {
   totalRules: number;
   planDistribution: Record<PlanTier, number>;
 }
+
+// =============================================================================
+// Presentes Personalizados, Controles, Músicas Oficiais/Pessoais e Rádio IA
+// =============================================================================
+
+export type GiftActionKey =
+  | 'move_walk'
+  | 'jump'
+  | 'special_action'
+  | 'boost_speed'
+  | 'spawn_effect'
+  | 'add_score'
+  | 'dance_celebrate'
+  | 'custom';
+
+export interface GiftMapping {
+  id: string;
+  userId: string;
+  gameId: string;
+  giftName: string;
+  minCount: number;
+  actionKey: GiftActionKey;
+  actionLabel: string;
+  actionCommand: string;
+  actionPayload: Record<string, unknown>;
+  cooldownMs: number;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type MusicScope = 'official' | 'personal';
+export type MusicSourceMode = 'official_only' | 'mixed' | 'personal_only';
+
+export interface MusicTrack {
+  id: string;
+  scope: MusicScope;
+  ownerUserId: string;
+  gameId: string; // 'all' or specific game ID
+  title: string;
+  artist: string;
+  genre: string;
+  mood: string;
+  bpm?: number;
+  durationSec?: number;
+  coverUrl?: string;
+  storagePath: string;
+  audioUrl: string;
+  mimeType: string;
+  fileSizeBytes: number;
+  isActive: boolean;
+  sortOrder: number;
+  aiTags: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MusicPlaylist {
+  id: string;
+  scope: MusicScope;
+  ownerUserId: string;
+  gameId: string;
+  name: string;
+  description: string;
+  trackIds: string[];
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GameMusicPreferences {
+  id: string;
+  userId: string;
+  gameId: string;
+  sourceMode: MusicSourceMode;
+  autoplayEnabled: boolean;
+  aiDjEnabled: boolean;
+  crossfadeSeconds: number;
+  volume: number;
+  muted: boolean;
+  preferredMood: string;
+  activePlaylistId?: string;
+  aiCuratedOrder: string[];
+  updatedAt: string;
+}
+
+export interface AdminAiMusicRule {
+  id: string;
+  gameId: string; // 'all' or specific game ID
+  defaultSourceMode: MusicSourceMode;
+  prioritizeOfficialRatio: number;
+  avoidRepeatWindow: number;
+  crossfadeSeconds: number;
+  preferredEnergy: string;
+  aiInstructions: string;
+  updatedAt: string;
+}
+
+export interface GameControlsConfig {
+  speedMultiplier: number;
+  actionIntensity: number;
+  globalCooldownMs: number;
+  enableKeyboardControls: boolean;
+  autoTriggerOnGift: boolean;
+  showGiftFeedInOverlay: boolean;
+  showMusicWidgetInOverlay: boolean;
+}
+
+export interface GameOverlayProfile {
+  id: string; // ov_...
+  userId: string;
+  gameId: string;
+  label: string;
+  tiktokUsername: string;
+  controlsConfig: GameControlsConfig;
+  overlayConfig: OverlayConfig;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}

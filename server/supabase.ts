@@ -1,9 +1,32 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import {
+  classifySupabaseKey,
+  isValidPublicSupabaseKey,
+  isValidSecretSupabaseKey,
+  type SupabaseKeyKind,
+} from '../src/lib/supabaseKeyUtils.js';
 
 export interface SupabaseEnvConfig {
   url: string;
   anonKey: string;
   serviceRoleKey: string;
+  publicKeyMode: SupabaseKeyKind;
+  secretKeyMode: SupabaseKeyKind;
+}
+
+export interface SupabasePingResult {
+  ok: boolean;
+  authConnected: boolean;
+  schemaReady: boolean;
+  migration001Ready: boolean;
+  migration002Ready: boolean;
+  storageBucketReady: boolean;
+  missingTables: string[];
+  usersCountHint: number;
+  keyModes: {
+    publicKey: SupabaseKeyKind;
+    secretKey: SupabaseKeyKind;
+  };
 }
 
 export function getSupabaseEnvConfig(): SupabaseEnvConfig {
@@ -16,14 +39,27 @@ export function getSupabaseEnvConfig(): SupabaseEnvConfig {
 
   const anonKey = (
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
     process.env.VITE_SUPABASE_ANON_KEY ||
+    process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
     process.env.SUPABASE_ANON_KEY ||
+    process.env.SUPABASE_PUBLISHABLE_KEY ||
     ''
   ).trim();
 
-  const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const serviceRoleKey = (
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_SECRET_KEY ||
+    ''
+  ).trim();
 
-  return { url, anonKey, serviceRoleKey };
+  return {
+    url,
+    anonKey,
+    serviceRoleKey,
+    publicKeyMode: classifySupabaseKey(anonKey),
+    secretKeyMode: classifySupabaseKey(serviceRoleKey),
+  };
 }
 
 export function getMissingSupabaseEnvVars(): string[] {
@@ -35,8 +71,36 @@ export function getMissingSupabaseEnvVars(): string[] {
   return missing;
 }
 
+export function getSupabaseConfigIssues(): string[] {
+  const cfg = getSupabaseEnvConfig();
+  const issues: string[] = [];
+  if (!cfg.url) {
+    issues.push('NEXT_PUBLIC_SUPABASE_URL não configurada.');
+  }
+  if (!cfg.anonKey) {
+    issues.push('NEXT_PUBLIC_SUPABASE_ANON_KEY (ou NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY) não configurada.');
+  } else if (!isValidPublicSupabaseKey(cfg.anonKey)) {
+    issues.push(
+      'NEXT_PUBLIC_SUPABASE_ANON_KEY inválida ou insegura (use sb_publishable_... ou chave pública anon, nunca sb_secret_...).',
+    );
+  }
+  if (!cfg.serviceRoleKey) {
+    issues.push('SUPABASE_SERVICE_ROLE_KEY (ou SUPABASE_SECRET_KEY) não configurada no servidor.');
+  } else if (!isValidSecretSupabaseKey(cfg.serviceRoleKey)) {
+    issues.push(
+      'SUPABASE_SERVICE_ROLE_KEY inválida (use sb_secret_... ou service_role JWT apenas no servidor).',
+    );
+  }
+  return issues;
+}
+
 export function isSupabaseConfigured(): boolean {
-  return getMissingSupabaseEnvVars().length === 0;
+  const cfg = getSupabaseEnvConfig();
+  return (
+    Boolean(cfg.url) &&
+    isValidPublicSupabaseKey(cfg.anonKey) &&
+    isValidSecretSupabaseKey(cfg.serviceRoleKey)
+  );
 }
 
 let cachedAdminKey = '';
@@ -44,10 +108,10 @@ let cachedAdminClient: SupabaseClient | null = null;
 
 export function getSupabaseAdmin(): SupabaseClient {
   const { url, serviceRoleKey } = getSupabaseEnvConfig();
-  if (!url || !serviceRoleKey) {
+  if (!url || !isValidSecretSupabaseKey(serviceRoleKey)) {
     const missing = getMissingSupabaseEnvVars().join(', ');
     throw new Error(
-      `Supabase não configurado no servidor. Variáveis ausentes: ${missing || 'NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY'}.`,
+      `Supabase não configurado corretamente no servidor. Verifique: ${missing || 'SUPABASE_SERVICE_ROLE_KEY (sb_secret_...)'}.`,
     );
   }
 
@@ -67,10 +131,10 @@ export function getSupabaseAdmin(): SupabaseClient {
 
 export function createSupabaseAuthClient(): SupabaseClient {
   const { url, anonKey } = getSupabaseEnvConfig();
-  if (!url || !anonKey) {
+  if (!url || !isValidPublicSupabaseKey(anonKey)) {
     const missing = getMissingSupabaseEnvVars().join(', ');
     throw new Error(
-      `Supabase Auth não configurado no servidor. Variáveis ausentes: ${missing || 'NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY'}.`,
+      `Supabase Auth não configurado corretamente. Verifique: ${missing || 'NEXT_PUBLIC_SUPABASE_ANON_KEY (sb_publishable_...)'}.`,
     );
   }
 
@@ -82,13 +146,9 @@ export function createSupabaseAuthClient(): SupabaseClient {
   });
 }
 
-export async function pingSupabase(): Promise<{ ok: true; usersCountHint: number }> {
+export async function pingSupabase(): Promise<SupabasePingResult> {
+  const cfg = getSupabaseEnvConfig();
   const admin = getSupabaseAdmin();
-
-  const { error: dbError } = await admin.from('platform_settings').select('id').limit(1);
-  if (dbError) {
-    throw new Error(`Falha ao consultar tabela platform_settings no Supabase: ${dbError.message}`);
-  }
 
   const { data: authData, error: authError } = await admin.auth.admin.listUsers({
     page: 1,
@@ -98,8 +158,59 @@ export async function pingSupabase(): Promise<{ ok: true; usersCountHint: number
     throw new Error(`Falha ao validar Supabase Auth Admin: ${authError.message}`);
   }
 
+  const migration001Tables = [
+    'platform_settings',
+    'users',
+    'games',
+    'user_saved_games',
+    'event_rules',
+    'live_events',
+    'subscriptions',
+  ];
+  const migration002Tables = [
+    'gift_mappings',
+    'music_tracks',
+    'music_playlists',
+    'game_music_preferences',
+    'admin_ai_music_rules',
+    'game_overlays',
+  ];
+
+  const allTables = [...migration001Tables, ...migration002Tables];
+  const tableChecks = await Promise.all(
+    allTables.map(async (tableName) => {
+      const probeCol = tableName === 'user_saved_games' ? 'user_id' : 'id';
+      const { error } = await admin.from(tableName).select(probeCol).limit(1);
+      return { tableName, missing: Boolean(error) };
+    }),
+  );
+
+  const missingTables = tableChecks.filter((item) => item.missing).map((item) => item.tableName);
+  const migration001Ready = migration001Tables.every((t) => !missingTables.includes(t));
+  const migration002Ready = migration002Tables.every((t) => !missingTables.includes(t));
+
+  let storageBucketReady = false;
+  try {
+    const { data: buckets } = await admin.storage.listBuckets();
+    storageBucketReady = Array.isArray(buckets) && buckets.some((b) => b.id === 'mlg-music');
+  } catch {
+    storageBucketReady = false;
+  }
+
+  const schemaReady = migration001Ready && migration002Ready && storageBucketReady;
+
   return {
-    ok: true,
+    ok: schemaReady,
+    authConnected: true,
+    schemaReady,
+    migration001Ready,
+    migration002Ready,
+    storageBucketReady,
+    missingTables,
     usersCountHint: authData.users.length,
+    keyModes: {
+      publicKey: cfg.publicKeyMode,
+      secretKey: cfg.secretKeyMode,
+    },
   };
 }

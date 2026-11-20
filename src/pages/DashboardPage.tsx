@@ -7,6 +7,7 @@ import {
   Lock,
   LogOut,
   Menu,
+  Music2,
   PlusCircle,
   Radio,
   Settings,
@@ -18,9 +19,14 @@ import {
   Zap,
 } from 'lucide-react';
 import { BrandLogo, LoadingScreen } from '../components/BrandMark';
+import { AdminMusicSection } from '../components/dashboard/AdminMusicSection';
 import { AdminSection } from '../components/dashboard/AdminSection';
 import { CreateGameSection } from '../components/dashboard/CreateGameSection';
 import { GamesLibrarySection } from '../components/dashboard/GamesLibrarySection';
+import {
+  GameWorkspaceModal,
+  type GameWorkspaceTab,
+} from '../components/dashboard/GameWorkspaceModal';
 import { ImportGameSection } from '../components/dashboard/ImportGameSection';
 import { IntegrationsSection } from '../components/dashboard/IntegrationsSection';
 import { LiveEventsSection } from '../components/dashboard/LiveEventsSection';
@@ -70,6 +76,10 @@ export function DashboardPage({ initialTab = 'overview', onNavigate }: Dashboard
   const { user, logout, toggleMyGame } = useAuth();
   const [activeTab, setActiveTab] = useState<DashboardTab>(initialTab);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [workspaceState, setWorkspaceState] = useState<{
+    game: GameItem;
+    tab: GameWorkspaceTab;
+  } | null>(null);
 
   const [games, setGames] = useState<GameItem[]>([]);
   const [rules, setRules] = useState<EventRule[]>([]);
@@ -225,7 +235,9 @@ export function DashboardPage({ initialTab = 'overview', onNavigate }: Dashboard
     ? 'Acesso restrito'
     : activeTab === 'admin'
       ? 'Administração'
-      : visibleNavItems.find((i) => i.id === activeTab)?.label || 'Visão geral';
+      : activeTab === 'admin-music'
+        ? 'Músicas Globais (ADM)'
+        : visibleNavItems.find((i) => i.id === activeTab)?.label || 'Visão geral';
 
   return (
     <div className="min-h-screen bg-[#07080D] text-[#F1F5F9] flex">
@@ -265,18 +277,32 @@ export function DashboardPage({ initialTab = 'overview', onNavigate }: Dashboard
           })}
 
           {isAdmin && (
-            <button
-              type="button"
-              onClick={() => selectTab('admin')}
-              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap mt-4 ${
-                activeTab === 'admin'
-                  ? 'bg-[#8B5CF6]/20 text-white border border-[#8B5CF6]/40'
-                  : 'text-purple-300 hover:bg-purple-500/10 border border-transparent'
-              }`}
-            >
-              <ShieldAlert className="w-4 h-4 shrink-0 text-[#A78BFA]" />
-              <span>Administração</span>
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => selectTab('admin-music')}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap mt-4 ${
+                  activeTab === 'admin-music'
+                    ? 'bg-[#22D3EE]/15 text-white border border-[#22D3EE]/40'
+                    : 'text-cyan-300 hover:bg-cyan-500/10 border border-transparent'
+                }`}
+              >
+                <Music2 className="w-4 h-4 shrink-0 text-[#22D3EE]" />
+                <span>Músicas Globais (ADM)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => selectTab('admin')}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap mt-1 ${
+                  activeTab === 'admin'
+                    ? 'bg-[#8B5CF6]/20 text-white border border-[#8B5CF6]/40'
+                    : 'text-purple-300 hover:bg-purple-500/10 border border-transparent'
+                }`}
+              >
+                <ShieldAlert className="w-4 h-4 shrink-0 text-[#A78BFA]" />
+                <span>Administração</span>
+              </button>
+            </>
           )}
         </nav>
 
@@ -333,14 +359,24 @@ export function DashboardPage({ initialTab = 'overview', onNavigate }: Dashboard
                 );
               })}
               {isAdmin && (
-                <button
-                  type="button"
-                  onClick={() => selectTab('admin')}
-                  className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-purple-300"
-                >
-                  <ShieldAlert className="w-4 h-4 shrink-0" />
-                  <span>Administração</span>
-                </button>
+                <>
+                  <button
+                    type="button"
+                    onClick={() => selectTab('admin-music')}
+                    className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-cyan-300"
+                  >
+                    <Music2 className="w-4 h-4 shrink-0" />
+                    <span>Músicas Globais (ADM)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => selectTab('admin')}
+                    className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-purple-300"
+                  >
+                    <ShieldAlert className="w-4 h-4 shrink-0" />
+                    <span>Administração</span>
+                  </button>
+                </>
               )}
             </nav>
             <div className="p-4 border-t border-white/10">
@@ -443,6 +479,7 @@ export function DashboardPage({ initialTab = 'overview', onNavigate }: Dashboard
                   onUpdateGame={handleUpdateGame}
                   onDeleteGame={handleDeleteGame}
                   onSelectTab={selectTab}
+                  onOpenWorkspace={(game, tab) => setWorkspaceState({ game, tab })}
                 />
               )}
 
@@ -463,6 +500,7 @@ export function DashboardPage({ initialTab = 'overview', onNavigate }: Dashboard
                   onUpdateGame={handleUpdateGame}
                   onDeleteGame={handleDeleteGame}
                   onSelectTab={selectTab}
+                  onOpenWorkspace={(game, tab) => setWorkspaceState({ game, tab })}
                 />
               )}
 
@@ -515,11 +553,27 @@ export function DashboardPage({ initialTab = 'overview', onNavigate }: Dashboard
 
               {activeTab === 'account' && <AccountSection user={user} onLogout={handleLogout} />}
 
+              {activeTab === 'admin-music' && isAdmin && <AdminMusicSection games={games} />}
+
               {activeTab === 'admin' && isAdmin && <AdminSection currentUser={user} />}
             </>
           )}
         </main>
       </div>
+
+      {workspaceState && (
+        <GameWorkspaceModal
+          game={workspaceState.game}
+          initialTab={workspaceState.tab}
+          userRole={user.role}
+          userPlan={user.plan}
+          tiktokStatus={tiktokStatus}
+          onConnectTikTok={handleConnectTikTok}
+          onDisconnectTikTok={handleDisconnectTikTok}
+          onSimulateEvent={handleSimulateEvent}
+          onClose={() => setWorkspaceState(null)}
+        />
+      )}
     </div>
   );
 }

@@ -1,4 +1,5 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { isValidPublicSupabaseKey } from './supabaseKeyUtils';
 
 let browserClient: SupabaseClient | null = null;
 
@@ -8,11 +9,16 @@ export function getBrowserSupabaseConfig(): { url: string; anonKey: string } {
     import.meta.env.VITE_SUPABASE_URL ||
     ''
   ).trim();
-  const anonKey = (
+  const rawPublicKey = (
     import.meta.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+    import.meta.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
     import.meta.env.VITE_SUPABASE_ANON_KEY ||
+    import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
     ''
   ).trim();
+
+  // Never allow a secret key (sb_secret_...) to initialize a browser client
+  const anonKey = isValidPublicSupabaseKey(rawPublicKey) ? rawPublicKey : '';
   return { url, anonKey };
 }
 

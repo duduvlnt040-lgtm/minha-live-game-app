@@ -1,8 +1,17 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { WatermarkBadge, LoadingScreen } from '../components/BrandMark';
+import { SmartMusicPlayer } from '../components/SmartMusicPlayer';
 import { preparePlayableHtml } from '../lib/zipValidator';
 import { apiRequest } from '../services/api';
-import type { LiveEventPayload, OverlayConfig } from '../types/platform';
+import type {
+  AdminAiMusicRule,
+  GameControlsConfig,
+  GameMusicPreferences,
+  LiveEventPayload,
+  MusicPlaylist,
+  MusicTrack,
+  OverlayConfig,
+} from '../types/platform';
 
 interface OverlayCapabilities {
   websocket: boolean;
@@ -11,12 +20,21 @@ interface OverlayCapabilities {
 
 interface OverlayData {
   id: string;
+  gameId?: string;
   name: string;
+  category?: string;
   engine: string;
   isActive: boolean;
   bundleHtml: string;
   overlayConfig: OverlayConfig;
+  controlsConfig?: GameControlsConfig;
   watermarkText: string;
+  music?: {
+    preferences: GameMusicPreferences;
+    adminRule: AdminAiMusicRule;
+    tracks: MusicTrack[];
+    playlists: MusicPlaylist[];
+  };
   capabilities?: OverlayCapabilities;
 }
 
@@ -303,6 +321,30 @@ export function OverlayPage({ gameId }: { gameId: string }) {
           {lastToast}
         </div>
       )}
+
+      {overlay.music &&
+        overlay.music.tracks.length > 0 &&
+        (overlay.controlsConfig?.showMusicWidgetInOverlay ?? true) && (
+          <SmartMusicPlayer
+            game={{
+              id: overlay.gameId || overlay.id,
+              name: overlay.name,
+              category: overlay.category || 'Interativo',
+              engine: overlay.engine,
+            }}
+            tracks={overlay.music.tracks}
+            preferences={overlay.music.preferences}
+            adminRule={overlay.music.adminRule}
+            activePlaylistTrackIds={
+              overlay.music.preferences.activePlaylistId
+                ? overlay.music.playlists.find(
+                    (p) => p.id === overlay.music?.preferences.activePlaylistId,
+                  )?.trackIds
+                : undefined
+            }
+            variant="overlay"
+          />
+        )}
 
       {overlay.overlayConfig.showWatermark && (
         <WatermarkBadge

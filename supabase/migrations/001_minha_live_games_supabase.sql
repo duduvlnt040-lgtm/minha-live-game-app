@@ -149,7 +149,8 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
-  IF COALESCE(auth.role(), '') <> 'service_role' THEN
+  IF current_user IN ('authenticated', 'anon')
+     AND COALESCE(auth.role(), '') <> 'service_role' THEN
     IF NEW.role IS DISTINCT FROM OLD.role
        OR NEW.plan IS DISTINCT FROM OLD.plan
        OR NEW.status IS DISTINCT FROM OLD.status THEN
@@ -196,6 +197,10 @@ BEGIN
       'g'
     )
   );
+
+  IF EXISTS (SELECT 1 FROM public.users WHERE lower(username) = v_username) THEN
+    v_username := substr(v_username, 1, 19) || '_' || substr(replace(NEW.id::text, '-', ''), 1, 4);
+  END IF;
 
   INSERT INTO public.users (id, name, username, email, role, plan, status, settings)
   VALUES (

@@ -1,13 +1,23 @@
 import crypto from 'node:crypto';
 import type { User as SupabaseAuthUser } from '@supabase/supabase-js';
 import type {
+  AdminAiMusicRule,
   AdminOverviewStats,
   EventRule,
   GameCategory,
+  GameControlsConfig,
   GameEngine,
   GameItem,
+  GameMusicPreferences,
+  GameOverlayProfile,
+  GiftActionKey,
+  GiftMapping,
   LiveEventPayload,
   LiveEventType,
+  MusicPlaylist,
+  MusicScope,
+  MusicSourceMode,
+  MusicTrack,
   OverlayConfig,
   PlatformSettings,
   PlanTier,
@@ -18,6 +28,9 @@ import type {
   UserRole,
   UserSettings,
 } from '../src/types/platform.js';
+import { getActionOption } from '../src/lib/giftActions.js';
+import { filterEligibleTracks, inferTrackMetadataFromFilename } from '../src/lib/smartMusicAi.js';
+import { isSupabaseApiKeyToken } from '../src/lib/supabaseKeyUtils.js';
 import { createSupabaseAuthClient, getSupabaseAdmin } from './supabase.js';
 
 export type StoredUser = UserProfile;
@@ -348,17 +361,21 @@ export async function ensureProfileForAuthUser(
 
   if (byId) {
     // Preserve existing 'admin' role permanently; auto-promote PRIMARY_ADMIN_EMAIL if needed
-    if (isPrimaryAdminEmail(byId.email) && byId.role !== 'admin') {
-      const { error: promoteErr } = await admin
-        .from('users')
-        .update({ role: 'admin', updated_at: new Date().toISOString() })
-        .eq('id', byId.id);
-      if (!promoteErr) {
-        byId.role = 'admin';
+    if (isPrimaryAdminEmail(byId.email)) {
+      if (byId.role !== 'admin') {
+        const { error: promoteErr } = await admin
+          .from('users')
+          .update({ role: 'admin', updated_at: new Date().toISOString() })
+          .eq('id', byId.id);
+        if (!promoteErr) {
+          byId.role = 'admin';
+        }
       }
-      await admin.auth.admin
-        .updateUserById(authUser.id, { app_metadata: { ...(authUser.app_metadata || {}), role: 'admin' } })
-        .catch(() => {});
+      if (authUser.app_metadata?.role !== 'admin') {
+        await admin.auth.admin
+          .updateUserById(authUser.id, { app_metadata: { ...(authUser.app_metadata || {}), role: 'admin' } })
+          .catch(() => {});
+      }
     }
 
     const myGameIds = await getUserSavedGameIds(byId.id);
@@ -377,12 +394,19 @@ export async function ensureProfileForAuthUser(
   }
 
   if (byEmail) {
-    if (isPrimaryAdminEmail(byEmail.email) && byEmail.role !== 'admin') {
-      await admin
-        .from('users')
-        .update({ role: 'admin', updated_at: new Date().toISOString() })
-        .eq('id', byEmail.id);
-      byEmail.role = 'admin';
+    if (isPrimaryAdminEmail(byEmail.email)) {
+      if (byEmail.role !== 'admin') {
+        await admin
+          .from('users')
+          .update({ role: 'admin', updated_at: new Date().toISOString() })
+          .eq('id', byEmail.id);
+        byEmail.role = 'admin';
+      }
+      if (authUser.app_metadata?.role !== 'admin') {
+        await admin.auth.admin
+          .updateUserById(authUser.id, { app_metadata: { ...(authUser.app_metadata || {}), role: 'admin' } })
+          .catch(() => {});
+      }
     }
     const myGameIds = await getUserSavedGameIds(byEmail.id);
     return mapUserRow(byEmail, myGameIds);
@@ -747,13 +771,18 @@ export async function findUserByAccessToken(
   user: StoredUser;
   refreshedSession?: AuthSessionTokens;
 } | null> {
-  if (!accessToken && !refreshToken) return null;
+  const usableAccessToken =
+    accessToken && !isSupabaseApiKeyToken(accessToken) ? accessToken : undefined;
+  const usableRefreshToken =
+    refreshToken && !isSupabaseApiKeyToken(refreshToken) ? refreshToken : undefined;
+
+  if (!usableAccessToken && !usableRefreshToken) return null;
 
   try {
     const admin = getSupabaseAdmin();
 
-    if (accessToken) {
-      const { data, error } = await admin.auth.getUser(accessToken);
+    if (usableAccessToken) {
+      const { data, error } = await admin.auth.getUser(usableAccessToken);
       if (!error && data.user) {
         const profile = await ensureProfileForAuthUser(data.user);
         if (profile.status !== 'active') return null;
@@ -761,10 +790,10 @@ export async function findUserByAccessToken(
       }
     }
 
-    if (refreshToken) {
+    if (usableRefreshToken) {
       const authClient = createSupabaseAuthClient();
       const { data, error } = await authClient.auth.refreshSession({
-        refresh_token: refreshToken,
+        refresh_token: usableRefreshToken,
       });
       if (!error && data.user && data.session) {
         const profile = await ensureProfileForAuthUser(data.user);
@@ -1333,19 +1362,26 @@ export async function recordLiveEvent(input: {
 export async function listOverlayEventsSince(
   gameId: string,
   sinceMs: number,
+  userId?: string,
 ): Promise<LiveEventPayload[]> {
   if (!Number.isFinite(sinceMs) || sinceMs <= 0) return [];
   try {
     const admin = getSupabaseAdmin();
     const sinceIso = new Date(sinceMs).toISOString();
     const safeGameId = gameId.replace(/"/g, '');
-    const { data, error } = await admin
+    let query = admin
       .from('live_events')
       .select('*')
       .or(`game_id.eq."${safeGameId}",game_id.eq.all`)
       .gte('created_at', sinceIso)
       .order('created_at', { ascending: true })
       .limit(30);
+
+    if (userId) {
+      query = query.eq('user_id', userId);
+    }
+
+    const { data, error } = await query;
 
     if (error) {
       throw new Error(error.message);
@@ -1585,4 +1621,1246 @@ export async function adminUpdateUser(
     console.error('Erro ao atualizar usuário pelo admin no Supabase:', err);
     throw new Error('Falha ao atualizar usuário no banco de dados.', { cause: err });
   }
+}
+
+// =============================================================================
+// Presentes Personalizados, Biblioteca Musical (ADM + Pessoal), Rádio IA e Overlays
+// =============================================================================
+
+export const MUSIC_BUCKET_NAME = 'mlg-music';
+const MAX_AUDIO_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
+
+const ALLOWED_AUDIO_MIME_MAP: Record<string, string> = {
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+  flac: 'audio/flac',
+  webm: 'audio/webm',
+};
+
+export function createDefaultControlsConfig(): GameControlsConfig {
+  return {
+    speedMultiplier: 1,
+    actionIntensity: 1,
+    globalCooldownMs: 0,
+    enableKeyboardControls: true,
+    autoTriggerOnGift: true,
+    showGiftFeedInOverlay: true,
+    showMusicWidgetInOverlay: true,
+  };
+}
+
+function mergeControlsConfig(raw: unknown): GameControlsConfig {
+  const defaults = createDefaultControlsConfig();
+  if (!raw || typeof raw !== 'object') return defaults;
+  return { ...defaults, ...(raw as Partial<GameControlsConfig>) };
+}
+
+interface DbGiftMappingRow {
+  id: string;
+  user_id: string;
+  game_id: string;
+  gift_name: string;
+  min_count: number;
+  action_key: GiftActionKey;
+  action_label: string;
+  action_command: string;
+  action_payload: Record<string, unknown> | null;
+  cooldown_ms: number;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+interface DbMusicTrackRow {
+  id: string;
+  scope: MusicScope;
+  owner_user_id: string;
+  game_id: string;
+  title: string;
+  artist: string;
+  genre: string;
+  mood: string;
+  bpm: number | null;
+  duration_sec: number | null;
+  cover_url: string | null;
+  storage_path: string;
+  audio_url: string;
+  mime_type: string;
+  file_size_bytes: number;
+  is_active: boolean;
+  sort_order: number;
+  ai_tags: string[] | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface DbMusicPlaylistRow {
+  id: string;
+  scope: MusicScope;
+  owner_user_id: string;
+  game_id: string;
+  name: string;
+  description: string;
+  track_ids: string[] | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+interface DbGameMusicPrefsRow {
+  id: string;
+  user_id: string;
+  game_id: string;
+  source_mode: MusicSourceMode;
+  autoplay_enabled: boolean;
+  ai_dj_enabled: boolean;
+  crossfade_seconds: number;
+  volume: number;
+  muted: boolean;
+  preferred_mood: string;
+  active_playlist_id: string | null;
+  ai_curated_order: string[] | null;
+  updated_at: string;
+}
+
+interface DbAdminAiRuleRow {
+  id: string;
+  game_id: string;
+  default_source_mode: MusicSourceMode;
+  prioritize_official_ratio: number;
+  avoid_repeat_window: number;
+  crossfade_seconds: number;
+  preferred_energy: string;
+  ai_instructions: string;
+  updated_at: string;
+}
+
+interface DbGameOverlayRow {
+  id: string;
+  user_id: string;
+  game_id: string;
+  label: string;
+  tiktok_username: string;
+  controls_config: GameControlsConfig | null;
+  overlay_config: OverlayConfig | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+function mapGiftMappingRow(row: DbGiftMappingRow): GiftMapping {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    gameId: row.game_id,
+    giftName: row.gift_name,
+    minCount: row.min_count,
+    actionKey: row.action_key,
+    actionLabel: row.action_label,
+    actionCommand: row.action_command,
+    actionPayload:
+      row.action_payload && typeof row.action_payload === 'object' ? row.action_payload : {},
+    cooldownMs: row.cooldown_ms,
+    enabled: row.enabled,
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+function mapMusicTrackRow(row: DbMusicTrackRow): MusicTrack {
+  return {
+    id: row.id,
+    scope: row.scope,
+    ownerUserId: row.owner_user_id,
+    gameId: row.game_id,
+    title: row.title,
+    artist: row.artist,
+    genre: row.genre,
+    mood: row.mood,
+    bpm: row.bpm ?? undefined,
+    durationSec: row.duration_sec ?? undefined,
+    coverUrl: row.cover_url ?? undefined,
+    storagePath: row.storage_path,
+    audioUrl: row.audio_url,
+    mimeType: row.mime_type,
+    fileSizeBytes: row.file_size_bytes,
+    isActive: row.is_active,
+    sortOrder: row.sort_order,
+    aiTags: Array.isArray(row.ai_tags) ? row.ai_tags : [],
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+function mapMusicPlaylistRow(row: DbMusicPlaylistRow): MusicPlaylist {
+  return {
+    id: row.id,
+    scope: row.scope,
+    ownerUserId: row.owner_user_id,
+    gameId: row.game_id,
+    name: row.name,
+    description: row.description,
+    trackIds: Array.isArray(row.track_ids) ? row.track_ids : [],
+    isActive: row.is_active,
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+function mapMusicPrefsRow(row: DbGameMusicPrefsRow): GameMusicPreferences {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    gameId: row.game_id,
+    sourceMode: row.source_mode,
+    autoplayEnabled: row.autoplay_enabled,
+    aiDjEnabled: row.ai_dj_enabled,
+    crossfadeSeconds: Number(row.crossfade_seconds ?? 2.5),
+    volume: Number(row.volume ?? 75),
+    muted: Boolean(row.muted),
+    preferredMood: row.preferred_mood || 'auto',
+    activePlaylistId: row.active_playlist_id ?? undefined,
+    aiCuratedOrder: Array.isArray(row.ai_curated_order) ? row.ai_curated_order : [],
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+function mapAdminAiRuleRow(row: DbAdminAiRuleRow): AdminAiMusicRule {
+  return {
+    id: row.id,
+    gameId: row.game_id,
+    defaultSourceMode: row.default_source_mode,
+    prioritizeOfficialRatio: Number(row.prioritize_official_ratio ?? 0.6),
+    avoidRepeatWindow: Number(row.avoid_repeat_window ?? 3),
+    crossfadeSeconds: Number(row.crossfade_seconds ?? 2.5),
+    preferredEnergy: row.preferred_energy || 'auto',
+    aiInstructions: row.ai_instructions || '',
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+function mapGameOverlayRow(row: DbGameOverlayRow): GameOverlayProfile {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    gameId: row.game_id,
+    label: row.label,
+    tiktokUsername: row.tiktok_username,
+    controlsConfig: mergeControlsConfig(row.controls_config),
+    overlayConfig: mergeOverlayConfig(row.overlay_config),
+    isActive: row.is_active,
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+// --- Gift Mappings CRUD ---
+
+export async function listGiftMappingsForUser(
+  userId: string,
+  gameId?: string,
+): Promise<GiftMapping[]> {
+  const admin = getSupabaseAdmin();
+  let query = admin
+    .from('gift_mappings')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false });
+
+  if (gameId && gameId !== 'all') {
+    query = query.eq('game_id', gameId);
+  }
+
+  const { data, error } = await query;
+  if (error) {
+    throw new Error(`Falha ao consultar presentes configurados: ${error.message}`);
+  }
+  return ((data || []) as DbGiftMappingRow[]).map(mapGiftMappingRow);
+}
+
+export async function createGiftMappingRecord(input: {
+  userId: string;
+  gameId: string;
+  giftName: string;
+  minCount?: number;
+  actionKey: GiftActionKey;
+  actionLabel?: string;
+  actionCommand?: string;
+  actionPayload?: Record<string, unknown>;
+  cooldownMs?: number;
+  enabled?: boolean;
+}): Promise<GiftMapping> {
+  const admin = getSupabaseAdmin();
+  const option = getActionOption(input.actionKey);
+  const nowIso = new Date().toISOString();
+
+  const { data, error } = await admin
+    .from('gift_mappings')
+    .insert({
+      id: `gmap_${crypto.randomUUID().slice(0, 10)}`,
+      user_id: input.userId,
+      game_id: input.gameId,
+      gift_name: input.giftName.trim().slice(0, 80),
+      min_count: Math.max(1, Number(input.minCount) || 1),
+      action_key: input.actionKey,
+      action_label: (input.actionLabel || option.label).trim().slice(0, 100),
+      action_command: (input.actionCommand || option.defaultCommand).trim().slice(0, 80),
+      action_payload:
+        input.actionPayload && typeof input.actionPayload === 'object'
+          ? input.actionPayload
+          : option.defaultPayload,
+      cooldown_ms: Math.max(0, Number(input.cooldownMs) || 0),
+      enabled: input.enabled !== false,
+      created_at: nowIso,
+      updated_at: nowIso,
+    })
+    .select('*')
+    .single<DbGiftMappingRow>();
+
+  if (error || !data) {
+    throw new Error(`Falha ao salvar mapeamento de presente: ${error?.message || 'erro interno'}`);
+  }
+  return mapGiftMappingRow(data);
+}
+
+export async function updateGiftMappingRecord(
+  mappingId: string,
+  userId: string,
+  patch: Partial<{
+    giftName: string;
+    minCount: number;
+    actionKey: GiftActionKey;
+    actionLabel: string;
+    actionCommand: string;
+    actionPayload: Record<string, unknown>;
+    cooldownMs: number;
+    enabled: boolean;
+  }>,
+): Promise<GiftMapping | null> {
+  const admin = getSupabaseAdmin();
+  const updatePayload: Record<string, unknown> = {
+    updated_at: new Date().toISOString(),
+  };
+
+  if (typeof patch.giftName === 'string' && patch.giftName.trim()) {
+    updatePayload.gift_name = patch.giftName.trim().slice(0, 80);
+  }
+  if (typeof patch.minCount === 'number') {
+    updatePayload.min_count = Math.max(1, patch.minCount);
+  }
+  if (patch.actionKey) {
+    const option = getActionOption(patch.actionKey);
+    updatePayload.action_key = patch.actionKey;
+    updatePayload.action_label = (patch.actionLabel || option.label).trim().slice(0, 100);
+    if (!patch.actionCommand) {
+      updatePayload.action_command = option.defaultCommand;
+    }
+  }
+  if (typeof patch.actionLabel === 'string' && patch.actionLabel.trim()) {
+    updatePayload.action_label = patch.actionLabel.trim().slice(0, 100);
+  }
+  if (typeof patch.actionCommand === 'string' && patch.actionCommand.trim()) {
+    updatePayload.action_command = patch.actionCommand.trim().slice(0, 80);
+  }
+  if (patch.actionPayload && typeof patch.actionPayload === 'object') {
+    updatePayload.action_payload = patch.actionPayload;
+  }
+  if (typeof patch.cooldownMs === 'number') {
+    updatePayload.cooldown_ms = Math.max(0, patch.cooldownMs);
+  }
+  if (typeof patch.enabled === 'boolean') {
+    updatePayload.enabled = patch.enabled;
+  }
+
+  const { data, error } = await admin
+    .from('gift_mappings')
+    .update(updatePayload)
+    .eq('id', mappingId)
+    .eq('user_id', userId)
+    .select('*')
+    .maybeSingle<DbGiftMappingRow>();
+
+  if (error) {
+    throw new Error(`Falha ao atualizar presente: ${error.message}`);
+  }
+  return data ? mapGiftMappingRow(data) : null;
+}
+
+export async function deleteGiftMappingRecord(mappingId: string, userId: string): Promise<boolean> {
+  const admin = getSupabaseAdmin();
+  const { data, error } = await admin
+    .from('gift_mappings')
+    .delete()
+    .eq('id', mappingId)
+    .eq('user_id', userId)
+    .select('id');
+
+  if (error) {
+    throw new Error(`Falha ao excluir presente: ${error.message}`);
+  }
+  return (data || []).length > 0;
+}
+
+// --- Supabase Storage Signed Audio Upload Helpers ---
+
+export async function createMusicSignedUploadUrl(params: {
+  userId: string;
+  scope: MusicScope;
+  fileName: string;
+  mimeType: string;
+  fileSizeBytes: number;
+}): Promise<{
+  signedUrl: string;
+  token: string;
+  storagePath: string;
+  audioUrl: string;
+  mimeType: string;
+}> {
+  if (params.fileSizeBytes <= 0 || params.fileSizeBytes > MAX_AUDIO_UPLOAD_BYTES) {
+    throw new Error('O arquivo de áudio deve ter entre 1 byte e 50 MB.');
+  }
+
+  const cleanFileName = params.fileName.trim().replace(/[^a-zA-Z0-9._-]/g, '_');
+  const extMatch = cleanFileName.toLowerCase().match(/\.([a-z0-9]+)$/);
+  const ext = extMatch?.[1] || '';
+  const resolvedMime =
+    ALLOWED_AUDIO_MIME_MAP[ext] ||
+    (params.mimeType && params.mimeType.startsWith('audio/') ? params.mimeType : '');
+
+  if (!resolvedMime) {
+    throw new Error('Formato de áudio inválido. Use MP3, WAV, OGG, M4A, AAC, FLAC ou WEBM.');
+  }
+
+  const prefix = params.scope === 'official' ? 'official/global' : `personal/${params.userId}`;
+  const storagePath = `${prefix}/${crypto.randomUUID().slice(0, 12)}_${cleanFileName.slice(0, 80)}`;
+
+  const admin = getSupabaseAdmin();
+  const { data, error } = await admin.storage
+    .from(MUSIC_BUCKET_NAME)
+    .createSignedUploadUrl(storagePath);
+
+  if (error || !data) {
+    throw new Error(
+      `Falha ao gerar URL de upload no Supabase Storage (${MUSIC_BUCKET_NAME}): ${error?.message || 'verifique a migration 002'}`,
+    );
+  }
+
+  const { data: pub } = admin.storage.from(MUSIC_BUCKET_NAME).getPublicUrl(storagePath);
+
+  return {
+    signedUrl: data.signedUrl,
+    token: data.token,
+    storagePath,
+    audioUrl: pub.publicUrl,
+    mimeType: resolvedMime,
+  };
+}
+
+export async function deleteMusicFileFromStorage(storagePath: string): Promise<void> {
+  if (!storagePath || storagePath.startsWith('http')) return;
+  try {
+    const admin = getSupabaseAdmin();
+    await admin.storage.from(MUSIC_BUCKET_NAME).remove([storagePath]);
+  } catch (err) {
+    console.warn('Aviso ao remover arquivo de áudio do Supabase Storage:', err);
+  }
+}
+
+// --- Music Tracks CRUD (Official & Personal) ---
+
+export async function listMusicTracksVisible(options: {
+  userId: string;
+  isAdmin: boolean;
+  gameId?: string;
+}): Promise<MusicTrack[]> {
+  const admin = getSupabaseAdmin();
+  const { data, error } = await admin
+    .from('music_tracks')
+    .select('*')
+    .order('sort_order', { ascending: true })
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    throw new Error(`Falha ao listar músicas no Supabase: ${error.message}`);
+  }
+
+  const allTracks = ((data || []) as DbMusicTrackRow[]).map(mapMusicTrackRow);
+
+  return allTracks.filter((t) => {
+    const gameMatches = !options.gameId || options.gameId === 'all' || t.gameId === options.gameId || t.gameId === 'all';
+    if (!gameMatches) return false;
+    if (options.isAdmin) return t.scope === 'official' || t.ownerUserId === options.userId;
+    return (t.scope === 'official' && t.isActive) || t.ownerUserId === options.userId;
+  });
+}
+
+export async function findMusicTrackById(trackId: string): Promise<MusicTrack | null> {
+  const admin = getSupabaseAdmin();
+  const { data, error } = await admin
+    .from('music_tracks')
+    .select('*')
+    .eq('id', trackId)
+    .maybeSingle<DbMusicTrackRow>();
+
+  if (error) {
+    throw new Error(`Falha ao buscar música: ${error.message}`);
+  }
+  return data ? mapMusicTrackRow(data) : null;
+}
+
+export async function createMusicTrackRecord(input: {
+  scope: MusicScope;
+  ownerUserId: string;
+  gameId: string;
+  title?: string;
+  artist?: string;
+  genre?: string;
+  mood?: string;
+  bpm?: number;
+  durationSec?: number;
+  coverUrl?: string;
+  storagePath: string;
+  audioUrl: string;
+  mimeType: string;
+  fileSizeBytes: number;
+  isActive?: boolean;
+  sortOrder?: number;
+  aiTags?: string[];
+  originalFileName?: string;
+}): Promise<MusicTrack> {
+  const admin = getSupabaseAdmin();
+  const inferred = inferTrackMetadataFromFilename(input.originalFileName || input.title || 'Faixa.mp3');
+  const nowIso = new Date().toISOString();
+
+  const { data, error } = await admin
+    .from('music_tracks')
+    .insert({
+      id: `trk_${crypto.randomUUID().slice(0, 10)}`,
+      scope: input.scope,
+      owner_user_id: input.ownerUserId,
+      game_id: input.gameId || 'all',
+      title: (input.title || inferred.title).trim().slice(0, 120),
+      artist: (input.artist ?? inferred.artist).trim().slice(0, 100),
+      genre: (input.genre || inferred.genre).trim().slice(0, 60),
+      mood: (input.mood || inferred.mood).trim().slice(0, 40),
+      bpm: typeof input.bpm === 'number' && input.bpm > 0 ? Math.round(input.bpm) : null,
+      duration_sec:
+        typeof input.durationSec === 'number' && input.durationSec > 0
+          ? Math.round(input.durationSec)
+          : null,
+      cover_url: input.coverUrl ?? null,
+      storage_path: input.storagePath,
+      audio_url: input.audioUrl,
+      mime_type: input.mimeType || 'audio/mpeg',
+      file_size_bytes: Math.max(0, Number(input.fileSizeBytes) || 0),
+      is_active: input.isActive !== false,
+      sort_order: Number(input.sortOrder) || 0,
+      ai_tags:
+        Array.isArray(input.aiTags) && input.aiTags.length > 0 ? input.aiTags : inferred.aiTags,
+      created_at: nowIso,
+      updated_at: nowIso,
+    })
+    .select('*')
+    .single<DbMusicTrackRow>();
+
+  if (error || !data) {
+    throw new Error(`Falha ao cadastrar música no Supabase: ${error?.message || 'erro interno'}`);
+  }
+  return mapMusicTrackRow(data);
+}
+
+export async function updateMusicTrackRecord(
+  trackId: string,
+  patch: Partial<{
+    gameId: string;
+    title: string;
+    artist: string;
+    genre: string;
+    mood: string;
+    bpm: number;
+    durationSec: number;
+    storagePath: string;
+    audioUrl: string;
+    mimeType: string;
+    fileSizeBytes: number;
+    isActive: boolean;
+    sortOrder: number;
+    aiTags: string[];
+  }>,
+): Promise<MusicTrack | null> {
+  const admin = getSupabaseAdmin();
+  const updatePayload: Record<string, unknown> = {
+    updated_at: new Date().toISOString(),
+  };
+
+  if (typeof patch.gameId === 'string') updatePayload.game_id = patch.gameId;
+  if (typeof patch.title === 'string' && patch.title.trim()) {
+    updatePayload.title = patch.title.trim().slice(0, 120);
+  }
+  if (typeof patch.artist === 'string') updatePayload.artist = patch.artist.trim().slice(0, 100);
+  if (typeof patch.genre === 'string') updatePayload.genre = patch.genre.trim().slice(0, 60);
+  if (typeof patch.mood === 'string') updatePayload.mood = patch.mood.trim().slice(0, 40);
+  if (typeof patch.bpm === 'number') updatePayload.bpm = Math.round(patch.bpm);
+  if (typeof patch.durationSec === 'number') updatePayload.duration_sec = Math.round(patch.durationSec);
+  if (typeof patch.storagePath === 'string') updatePayload.storage_path = patch.storagePath;
+  if (typeof patch.audioUrl === 'string') updatePayload.audio_url = patch.audioUrl;
+  if (typeof patch.mimeType === 'string') updatePayload.mime_type = patch.mimeType;
+  if (typeof patch.fileSizeBytes === 'number') updatePayload.file_size_bytes = patch.fileSizeBytes;
+  if (typeof patch.isActive === 'boolean') updatePayload.is_active = patch.isActive;
+  if (typeof patch.sortOrder === 'number') updatePayload.sort_order = patch.sortOrder;
+  if (Array.isArray(patch.aiTags)) updatePayload.ai_tags = patch.aiTags;
+
+  const { data, error } = await admin
+    .from('music_tracks')
+    .update(updatePayload)
+    .eq('id', trackId)
+    .select('*')
+    .maybeSingle<DbMusicTrackRow>();
+
+  if (error) {
+    throw new Error(`Falha ao atualizar faixa musical: ${error.message}`);
+  }
+  return data ? mapMusicTrackRow(data) : null;
+}
+
+export async function deleteMusicTrackRecord(trackId: string): Promise<MusicTrack | null> {
+  const existing = await findMusicTrackById(trackId);
+  if (!existing) return null;
+
+  const admin = getSupabaseAdmin();
+  const { error } = await admin.from('music_tracks').delete().eq('id', trackId);
+  if (error) {
+    throw new Error(`Falha ao excluir música: ${error.message}`);
+  }
+  await deleteMusicFileFromStorage(existing.storagePath);
+  return existing;
+}
+
+// --- Music Playlists CRUD ---
+
+export async function listMusicPlaylistsVisible(options: {
+  userId: string;
+  isAdmin: boolean;
+  gameId?: string;
+}): Promise<MusicPlaylist[]> {
+  const admin = getSupabaseAdmin();
+  const { data, error } = await admin
+    .from('music_playlists')
+    .select('*')
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    throw new Error(`Falha ao listar playlists musicais: ${error.message}`);
+  }
+
+  return ((data || []) as DbMusicPlaylistRow[])
+    .map(mapMusicPlaylistRow)
+    .filter((pl) => {
+      const gameMatches = !options.gameId || options.gameId === 'all' || pl.gameId === options.gameId || pl.gameId === 'all';
+      if (!gameMatches) return false;
+      if (options.isAdmin) return pl.scope === 'official' || pl.ownerUserId === options.userId;
+      return (pl.scope === 'official' && pl.isActive) || pl.ownerUserId === options.userId;
+    });
+}
+
+export async function findMusicPlaylistById(playlistId: string): Promise<MusicPlaylist | null> {
+  const admin = getSupabaseAdmin();
+  const { data, error } = await admin
+    .from('music_playlists')
+    .select('*')
+    .eq('id', playlistId)
+    .maybeSingle<DbMusicPlaylistRow>();
+
+  if (error) {
+    throw new Error(`Falha ao buscar playlist: ${error.message}`);
+  }
+  return data ? mapMusicPlaylistRow(data) : null;
+}
+
+export async function createMusicPlaylistRecord(input: {
+  scope: MusicScope;
+  ownerUserId: string;
+  gameId: string;
+  name: string;
+  description?: string;
+  trackIds?: string[];
+  isActive?: boolean;
+}): Promise<MusicPlaylist> {
+  const admin = getSupabaseAdmin();
+  const nowIso = new Date().toISOString();
+  const { data, error } = await admin
+    .from('music_playlists')
+    .insert({
+      id: `pl_${crypto.randomUUID().slice(0, 10)}`,
+      scope: input.scope,
+      owner_user_id: input.ownerUserId,
+      game_id: input.gameId || 'all',
+      name: input.name.trim().slice(0, 100),
+      description: String(input.description || '').trim().slice(0, 300),
+      track_ids: Array.isArray(input.trackIds) ? input.trackIds : [],
+      is_active: input.isActive !== false,
+      created_at: nowIso,
+      updated_at: nowIso,
+    })
+    .select('*')
+    .single<DbMusicPlaylistRow>();
+
+  if (error || !data) {
+    throw new Error(`Falha ao criar playlist: ${error?.message || 'erro interno'}`);
+  }
+  return mapMusicPlaylistRow(data);
+}
+
+export async function updateMusicPlaylistRecord(
+  playlistId: string,
+  patch: Partial<{
+    name: string;
+    description: string;
+    gameId: string;
+    trackIds: string[];
+    isActive: boolean;
+  }>,
+): Promise<MusicPlaylist | null> {
+  const admin = getSupabaseAdmin();
+  const updatePayload: Record<string, unknown> = {
+    updated_at: new Date().toISOString(),
+  };
+  if (typeof patch.name === 'string' && patch.name.trim()) {
+    updatePayload.name = patch.name.trim().slice(0, 100);
+  }
+  if (typeof patch.description === 'string') {
+    updatePayload.description = patch.description.trim().slice(0, 300);
+  }
+  if (typeof patch.gameId === 'string') updatePayload.game_id = patch.gameId;
+  if (Array.isArray(patch.trackIds)) updatePayload.track_ids = patch.trackIds;
+  if (typeof patch.isActive === 'boolean') updatePayload.is_active = patch.isActive;
+
+  const { data, error } = await admin
+    .from('music_playlists')
+    .update(updatePayload)
+    .eq('id', playlistId)
+    .select('*')
+    .maybeSingle<DbMusicPlaylistRow>();
+
+  if (error) {
+    throw new Error(`Falha ao atualizar playlist: ${error.message}`);
+  }
+  return data ? mapMusicPlaylistRow(data) : null;
+}
+
+export async function deleteMusicPlaylistRecord(playlistId: string): Promise<boolean> {
+  const admin = getSupabaseAdmin();
+  const { data, error } = await admin
+    .from('music_playlists')
+    .delete()
+    .eq('id', playlistId)
+    .select('id');
+
+  if (error) {
+    throw new Error(`Falha ao excluir playlist: ${error.message}`);
+  }
+  return (data || []).length > 0;
+}
+
+// --- Game Music Preferences & Admin AI Music Rules ---
+
+export function createDefaultGameMusicPreferences(
+  userId: string,
+  gameId: string,
+): GameMusicPreferences {
+  return {
+    id: `gmp_default_${gameId}`,
+    userId,
+    gameId,
+    sourceMode: 'mixed',
+    autoplayEnabled: true,
+    aiDjEnabled: true,
+    crossfadeSeconds: 2.5,
+    volume: 75,
+    muted: false,
+    preferredMood: 'auto',
+    activePlaylistId: undefined,
+    aiCuratedOrder: [],
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+export async function getGameMusicPreferencesRecord(
+  userId: string,
+  gameId: string,
+): Promise<GameMusicPreferences> {
+  const admin = getSupabaseAdmin();
+  const { data, error } = await admin
+    .from('game_music_preferences')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('game_id', gameId)
+    .maybeSingle<DbGameMusicPrefsRow>();
+
+  if (error) {
+    throw new Error(`Falha ao carregar preferências musicais: ${error.message}`);
+  }
+  return data ? mapMusicPrefsRow(data) : createDefaultGameMusicPreferences(userId, gameId);
+}
+
+export async function upsertGameMusicPreferencesRecord(
+  userId: string,
+  gameId: string,
+  patch: Partial<{
+    sourceMode: MusicSourceMode;
+    autoplayEnabled: boolean;
+    aiDjEnabled: boolean;
+    crossfadeSeconds: number;
+    volume: number;
+    muted: boolean;
+    preferredMood: string;
+    activePlaylistId: string | null;
+    aiCuratedOrder: string[];
+  }>,
+): Promise<GameMusicPreferences> {
+  const admin = getSupabaseAdmin();
+  const current = await getGameMusicPreferencesRecord(userId, gameId);
+  const nowIso = new Date().toISOString();
+
+  const nextId = current.id.startsWith('gmp_default_')
+    ? `gmp_${crypto.randomUUID().slice(0, 10)}`
+    : current.id;
+
+  const payload = {
+    id: nextId,
+    user_id: userId,
+    game_id: gameId,
+    source_mode: patch.sourceMode ?? current.sourceMode,
+    autoplay_enabled: patch.autoplayEnabled ?? current.autoplayEnabled,
+    ai_dj_enabled: patch.aiDjEnabled ?? current.aiDjEnabled,
+    crossfade_seconds:
+      typeof patch.crossfadeSeconds === 'number'
+        ? Math.max(0, Math.min(8, patch.crossfadeSeconds))
+        : current.crossfadeSeconds,
+    volume:
+      typeof patch.volume === 'number'
+        ? Math.max(0, Math.min(100, Math.round(patch.volume)))
+        : current.volume,
+    muted: patch.muted ?? current.muted,
+    preferred_mood: patch.preferredMood ?? current.preferredMood,
+    active_playlist_id:
+      patch.activePlaylistId === null
+        ? null
+        : patch.activePlaylistId ?? current.activePlaylistId ?? null,
+    ai_curated_order: patch.aiCuratedOrder ?? current.aiCuratedOrder,
+    updated_at: nowIso,
+  };
+
+  const { data, error } = await admin
+    .from('game_music_preferences')
+    .upsert(payload, { onConflict: 'user_id,game_id' })
+    .select('*')
+    .single<DbGameMusicPrefsRow>();
+
+  if (error || !data) {
+    throw new Error(`Falha ao salvar preferências musicais: ${error?.message || 'erro interno'}`);
+  }
+  return mapMusicPrefsRow(data);
+}
+
+export async function listAdminAiMusicRules(): Promise<AdminAiMusicRule[]> {
+  const admin = getSupabaseAdmin();
+  const { data, error } = await admin
+    .from('admin_ai_music_rules')
+    .select('*')
+    .order('updated_at', { ascending: false });
+
+  if (error) {
+    throw new Error(`Falha ao consultar regras globais de IA musical: ${error.message}`);
+  }
+  return ((data || []) as DbAdminAiRuleRow[]).map(mapAdminAiRuleRow);
+}
+
+export async function getEffectiveAdminAiRule(gameId: string): Promise<AdminAiMusicRule> {
+  const rules = await listAdminAiMusicRules();
+  const specific = rules.find((r) => r.gameId === gameId);
+  if (specific) return specific;
+  const globalRule = rules.find((r) => r.gameId === 'all');
+  if (globalRule) return globalRule;
+  return {
+    id: 'airule_all',
+    gameId: 'all',
+    defaultSourceMode: 'mixed',
+    prioritizeOfficialRatio: 0.6,
+    avoidRepeatWindow: 3,
+    crossfadeSeconds: 2.5,
+    preferredEnergy: 'auto',
+    aiInstructions:
+      'Alternar dinamicamente músicas oficiais e pessoais sem repetir faixas consecutivas.',
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+export async function upsertAdminAiMusicRule(
+  gameId: string,
+  patch: Partial<{
+    defaultSourceMode: MusicSourceMode;
+    prioritizeOfficialRatio: number;
+    avoidRepeatWindow: number;
+    crossfadeSeconds: number;
+    preferredEnergy: string;
+    aiInstructions: string;
+  }>,
+): Promise<AdminAiMusicRule> {
+  const admin = getSupabaseAdmin();
+  const existing = await getEffectiveAdminAiRule(gameId);
+  const nowIso = new Date().toISOString();
+
+  const rowId =
+    existing.gameId === gameId
+      ? existing.id
+      : gameId === 'all'
+        ? 'airule_all'
+        : `airule_${crypto.randomUUID().slice(0, 10)}`;
+
+  const { data, error } = await admin
+    .from('admin_ai_music_rules')
+    .upsert(
+      {
+        id: rowId,
+        game_id: gameId,
+        default_source_mode: patch.defaultSourceMode ?? existing.defaultSourceMode,
+        prioritize_official_ratio:
+          typeof patch.prioritizeOfficialRatio === 'number'
+            ? Math.max(0, Math.min(1, patch.prioritizeOfficialRatio))
+            : existing.prioritizeOfficialRatio,
+        avoid_repeat_window:
+          typeof patch.avoidRepeatWindow === 'number'
+            ? Math.max(1, Math.min(20, Math.round(patch.avoidRepeatWindow)))
+            : existing.avoidRepeatWindow,
+        crossfade_seconds:
+          typeof patch.crossfadeSeconds === 'number'
+            ? Math.max(0, Math.min(8, patch.crossfadeSeconds))
+            : existing.crossfadeSeconds,
+        preferred_energy: patch.preferredEnergy ?? existing.preferredEnergy,
+        ai_instructions: String(patch.aiInstructions ?? existing.aiInstructions).slice(0, 600),
+        updated_at: nowIso,
+      },
+      { onConflict: 'game_id' },
+    )
+    .select('*')
+    .single<DbAdminAiRuleRow>();
+
+  if (error || !data) {
+    throw new Error(`Falha ao salvar regra global de IA musical: ${error?.message || 'erro interno'}`);
+  }
+  return mapAdminAiRuleRow(data);
+}
+
+// --- Custom Per-User, Per-Game Overlay Profiles (ov_...) ---
+
+export async function listUserOverlayProfiles(userId: string): Promise<GameOverlayProfile[]> {
+  const admin = getSupabaseAdmin();
+  const { data, error } = await admin
+    .from('game_overlays')
+    .select('*')
+    .eq('user_id', userId)
+    .order('updated_at', { ascending: false });
+
+  if (error) {
+    throw new Error(`Falha ao listar links de overlay: ${error.message}`);
+  }
+  return ((data || []) as DbGameOverlayRow[]).map(mapGameOverlayRow);
+}
+
+export async function findOverlayProfileById(overlayId: string): Promise<GameOverlayProfile | null> {
+  const admin = getSupabaseAdmin();
+  const { data, error } = await admin
+    .from('game_overlays')
+    .select('*')
+    .eq('id', overlayId)
+    .maybeSingle<DbGameOverlayRow>();
+
+  if (error) {
+    throw new Error(`Falha ao buscar overlay: ${error.message}`);
+  }
+  return data ? mapGameOverlayRow(data) : null;
+}
+
+export async function findOverlayIdsForUserAndGame(
+  userId: string,
+  gameId: string,
+): Promise<string[]> {
+  const admin = getSupabaseAdmin();
+  let query = admin.from('game_overlays').select('id').eq('user_id', userId);
+  if (gameId && gameId !== 'all') {
+    query = query.eq('game_id', gameId);
+  }
+  const { data, error } = await query;
+  if (error) return [];
+  return ((data || []) as Array<{ id: string }>).map((r) => r.id);
+}
+
+export async function getOrCreateGameOverlayProfile(
+  userId: string,
+  gameId: string,
+  patch?: Partial<{
+    label: string;
+    tiktokUsername: string;
+    controlsConfig: Partial<GameControlsConfig>;
+    overlayConfig: Partial<OverlayConfig>;
+    isActive: boolean;
+  }>,
+): Promise<GameOverlayProfile | null> {
+  const game = await findGameById(gameId);
+  if (!game) return null;
+
+  const admin = getSupabaseAdmin();
+  const { data: existing, error: fetchErr } = await admin
+    .from('game_overlays')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('game_id', gameId)
+    .maybeSingle<DbGameOverlayRow>();
+
+  if (fetchErr) {
+    throw new Error(`Falha ao consultar overlay do jogo: ${fetchErr.message}`);
+  }
+
+  const nowIso = new Date().toISOString();
+  if (existing && !patch) {
+    return mapGameOverlayRow(existing);
+  }
+
+  const currentMapped = existing ? mapGameOverlayRow(existing) : null;
+  const nextControls: GameControlsConfig = {
+    ...(currentMapped?.controlsConfig || createDefaultControlsConfig()),
+    ...(patch?.controlsConfig || {}),
+  };
+  const nextOverlayConfig: OverlayConfig = {
+    ...(currentMapped?.overlayConfig || game.overlayConfig || createDefaultOverlayConfig()),
+    ...(patch?.overlayConfig || {}),
+  };
+
+  const payload = {
+    id: currentMapped?.id || `ov_${crypto.randomUUID().slice(0, 12)}`,
+    user_id: userId,
+    game_id: gameId,
+    label: (patch?.label ?? currentMapped?.label ?? `${game.name} Overlay`).slice(0, 100),
+    tiktok_username: (patch?.tiktokUsername ?? currentMapped?.tiktokUsername ?? '')
+      .trim()
+      .replace(/^@+/, '')
+      .slice(0, 40),
+    controls_config: nextControls,
+    overlay_config: nextOverlayConfig,
+    is_active: patch?.isActive ?? currentMapped?.isActive ?? true,
+    created_at: currentMapped?.createdAt || nowIso,
+    updated_at: nowIso,
+  };
+
+  const { data: saved, error: saveErr } = await admin
+    .from('game_overlays')
+    .upsert(payload, { onConflict: 'user_id,game_id' })
+    .select('*')
+    .single<DbGameOverlayRow>();
+
+  if (saveErr || !saved) {
+    throw new Error(`Falha ao salvar overlay personalizado: ${saveErr?.message || 'erro interno'}`);
+  }
+
+  return mapGameOverlayRow(saved);
+}
+
+export async function regenerateGameOverlayProfileId(
+  userId: string,
+  gameId: string,
+): Promise<GameOverlayProfile | null> {
+  const existing = await getOrCreateGameOverlayProfile(userId, gameId);
+  if (!existing) return null;
+
+  const admin = getSupabaseAdmin();
+  const nextId = `ov_${crypto.randomUUID().slice(0, 12)}`;
+  const { data, error } = await admin
+    .from('game_overlays')
+    .update({ id: nextId, updated_at: new Date().toISOString() })
+    .eq('user_id', userId)
+    .eq('game_id', gameId)
+    .select('*')
+    .single<DbGameOverlayRow>();
+
+  if (error || !data) {
+    throw new Error(`Falha ao regenerar link de overlay: ${error?.message || 'erro interno'}`);
+  }
+  return mapGameOverlayRow(data);
+}
+
+export async function resolveOverlayTargetForEvents(id: string): Promise<{
+  overlayId: string;
+  gameId: string;
+  userId?: string;
+  isActive: boolean;
+  overlayConfig: OverlayConfig;
+} | null> {
+  if (id.startsWith('ov_')) {
+    const profile = await findOverlayProfileById(id);
+    if (!profile) return null;
+    const game = await findGameById(profile.gameId);
+    if (!game) return null;
+    return {
+      overlayId: profile.id,
+      gameId: game.id,
+      userId: profile.userId,
+      isActive: game.isActive && profile.isActive,
+      overlayConfig: profile.overlayConfig,
+    };
+  }
+
+  const game = await findGameById(id);
+  if (!game) return null;
+  return {
+    overlayId: game.id,
+    gameId: game.id,
+    isActive: game.isActive,
+    overlayConfig: game.overlayConfig,
+  };
+}
+
+export async function resolvePublicOverlayBundle(id: string): Promise<{
+  overlayId: string;
+  game: GameItem;
+  isActive: boolean;
+  overlayConfig: OverlayConfig;
+  controlsConfig: GameControlsConfig;
+  tiktokUsername: string;
+  watermarkText: string;
+  giftMappings: Array<{
+    id: string;
+    giftName: string;
+    minCount: number;
+    actionKey: GiftActionKey;
+    actionLabel: string;
+    actionCommand: string;
+  }>;
+  music: {
+    preferences: GameMusicPreferences;
+    adminRule: AdminAiMusicRule;
+    tracks: MusicTrack[];
+    playlists: MusicPlaylist[];
+  };
+} | null> {
+  const settings = await getPlatformSettings();
+
+  if (id.startsWith('ov_')) {
+    const profile = await findOverlayProfileById(id);
+    if (!profile) return null;
+    const game = await findGameById(profile.gameId);
+    if (!game) return null;
+
+    const [giftMappings, allTracks, allPlaylists, preferences, adminRule] = await Promise.all([
+      listGiftMappingsForUser(profile.userId, game.id),
+      listMusicTracksVisible({ userId: profile.userId, isAdmin: false, gameId: game.id }),
+      listMusicPlaylistsVisible({ userId: profile.userId, isAdmin: false, gameId: game.id }),
+      getGameMusicPreferencesRecord(profile.userId, game.id),
+      getEffectiveAdminAiRule(game.id),
+    ]);
+
+    const activePlaylist = preferences.activePlaylistId
+      ? allPlaylists.find((p) => p.id === preferences.activePlaylistId && p.isActive)
+      : undefined;
+
+    const eligibleTracks = filterEligibleTracks(
+      allTracks,
+      preferences.sourceMode || adminRule.defaultSourceMode,
+      game.id,
+      activePlaylist?.trackIds,
+    );
+
+    return {
+      overlayId: profile.id,
+      game,
+      isActive: game.isActive && profile.isActive,
+      overlayConfig: profile.overlayConfig,
+      controlsConfig: profile.controlsConfig,
+      tiktokUsername: profile.tiktokUsername,
+      watermarkText: settings.defaultWatermarkText || 'MINHA LIVE GAMES',
+      giftMappings: giftMappings
+        .filter((m) => m.enabled)
+        .map((m) => ({
+          id: m.id,
+          giftName: m.giftName,
+          minCount: m.minCount,
+          actionKey: m.actionKey,
+          actionLabel: m.actionLabel,
+          actionCommand: m.actionCommand,
+        })),
+      music: {
+        preferences,
+        adminRule,
+        tracks: eligibleTracks.length > 0 ? eligibleTracks : allTracks.filter((t) => t.isActive),
+        playlists: allPlaylists,
+      },
+    };
+  }
+
+  // Legacy /overlay/gm_... support — 100% preserved and enriched with official music
+  const game = await findGameById(id);
+  if (!game) return null;
+
+  let officialTracks: MusicTrack[] = [];
+  let officialPlaylists: MusicPlaylist[] = [];
+  let adminRule = await getEffectiveAdminAiRule(game.id).catch(() => ({
+    id: 'airule_all',
+    gameId: 'all',
+    defaultSourceMode: 'official_only' as MusicSourceMode,
+    prioritizeOfficialRatio: 1,
+    avoidRepeatWindow: 3,
+    crossfadeSeconds: 2.5,
+    preferredEnergy: 'auto',
+    aiInstructions: '',
+    updatedAt: new Date().toISOString(),
+  }));
+
+  try {
+    const admin = getSupabaseAdmin();
+    const [trkRes, plRes] = await Promise.all([
+      admin
+        .from('music_tracks')
+        .select('*')
+        .eq('scope', 'official')
+        .eq('is_active', true)
+        .order('sort_order', { ascending: true }),
+      admin
+        .from('music_playlists')
+        .select('*')
+        .eq('scope', 'official')
+        .eq('is_active', true),
+    ]);
+    officialTracks = ((trkRes.data || []) as DbMusicTrackRow[])
+      .map(mapMusicTrackRow)
+      .filter((t) => t.gameId === game.id || t.gameId === 'all');
+    officialPlaylists = ((plRes.data || []) as DbMusicPlaylistRow[])
+      .map(mapMusicPlaylistRow)
+      .filter((p) => p.gameId === game.id || p.gameId === 'all');
+  } catch {
+    // Non-fatal if migration 002 tables are not yet applied on an older DB
+  }
+
+  return {
+    overlayId: game.id,
+    game,
+    isActive: game.isActive,
+    overlayConfig: game.overlayConfig,
+    controlsConfig: createDefaultControlsConfig(),
+    tiktokUsername: '',
+    watermarkText: settings.defaultWatermarkText || 'MINHA LIVE GAMES',
+    giftMappings: [],
+    music: {
+      preferences: {
+        ...createDefaultGameMusicPreferences(game.userId, game.id),
+        sourceMode: 'official_only',
+        crossfadeSeconds: adminRule.crossfadeSeconds,
+      },
+      adminRule,
+      tracks: officialTracks,
+      playlists: officialPlaylists,
+    },
+  };
 }

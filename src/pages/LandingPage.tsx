@@ -42,7 +42,7 @@ export function LandingPage({ onNavigate }: LandingPageProps) {
     <div className="min-h-screen bg-[#07080D] text-[#F1F5F9]">
       {/* Top Bar Contract: 3 zones separated by gap-8 */}
       <header className="sticky top-0 z-40 border-b border-white/10 bg-[#07080D]/90 backdrop-blur-md">
-        <div className="max-w-[1280px] mx-auto px-6 py-4 flex items-center justify-between gap-8">
+        <div className="max-w-[1280px] mx-auto px-4 sm:px-6 py-4 flex items-center justify-between gap-2 sm:gap-8">
           <a
             href="/"
             onClick={(e) => {
@@ -69,7 +69,7 @@ export function LandingPage({ onNavigate }: LandingPageProps) {
             </a>
           </nav>
 
-          <div className="flex items-center gap-4 shrink-0">
+          <div className="flex items-center gap-2 sm:gap-4 shrink-0">
             {user ? (
               <button
                 type="button"

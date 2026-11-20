@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   BookmarkCheck,
   BookmarkPlus,
@@ -7,15 +7,29 @@ import {
   Eye,
   EyeOff,
   Gamepad2,
+  Gift,
   Library,
+  Music,
   Play,
+  Radio,
   Search,
+  Sliders,
   Trash2,
   Upload,
 } from 'lucide-react';
 import type { DashboardTab } from '../../lib/rbac';
-import type { GameCategory, GameItem, UserRole } from '../../types/platform';
+import { apiRequest } from '../../services/api';
+import type {
+  AdminAiMusicRule,
+  GameCategory,
+  GameItem,
+  GameMusicPreferences,
+  MusicTrack,
+  UserRole,
+} from '../../types/platform';
 import { GamePlayer } from '../GamePlayer';
+import { SmartMusicPlayer } from '../SmartMusicPlayer';
+import type { GameWorkspaceTab } from './GameWorkspaceModal';
 
 interface GamesLibrarySectionProps {
   mode: 'library' | 'my-games';
@@ -29,6 +43,7 @@ interface GamesLibrarySectionProps {
   onUpdateGame: (id: string, payload: Partial<GameItem>) => Promise<void>;
   onDeleteGame: (id: string) => Promise<void>;
   onSelectTab: (tab: DashboardTab) => void;
+  onOpenWorkspace?: (game: GameItem, tab: GameWorkspaceTab) => void;
 }
 
 const CATEGORIES: Array<'Todas' | GameCategory> = [
@@ -54,11 +69,15 @@ export function GamesLibrarySection({
   onUpdateGame,
   onDeleteGame,
   onSelectTab,
+  onOpenWorkspace,
 }: GamesLibrarySectionProps) {
   const isAdmin = userRole === 'admin';
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState<'Todas' | GameCategory>('Todas');
   const [previewGameId, setPreviewGameId] = useState<string | null>(null);
+  const [previewMusicTracks, setPreviewMusicTracks] = useState<MusicTrack[]>([]);
+  const [previewMusicPrefs, setPreviewMusicPrefs] = useState<GameMusicPreferences | null>(null);
+  const [previewAdminRule, setPreviewAdminRule] = useState<AdminAiMusicRule | null>(null);
   const [editingGame, setEditingGame] = useState<GameItem | null>(null);
   const [editName, setEditName] = useState('');
   const [editDesc, setEditDesc] = useState('');
@@ -67,6 +86,31 @@ export function GamesLibrarySection({
   const [saving, setSaving] = useState(false);
   const [busyGameId, setBusyGameId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!previewGameId) return;
+    let cancelled = false;
+    Promise.all([
+      apiRequest<{ tracks: MusicTrack[] }>(
+        `/api/music/tracks?gameId=${encodeURIComponent(previewGameId)}`,
+      ),
+      apiRequest<{ preferences: GameMusicPreferences; adminRule: AdminAiMusicRule }>(
+        `/api/music/preferences/${encodeURIComponent(previewGameId)}`,
+      ),
+    ])
+      .then(([trkRes, prefRes]) => {
+        if (cancelled) return;
+        setPreviewMusicTracks(trkRes.tracks);
+        setPreviewMusicPrefs(prefRes.preferences);
+        setPreviewAdminRule(prefRes.adminRule);
+      })
+      .catch(() => {
+        // Non-fatal fallback
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [previewGameId]);
 
   const filtered = games.filter((g) => {
     const matchCategory = categoryFilter === 'Todas' || g.category === categoryFilter;
@@ -180,26 +224,44 @@ export function GamesLibrarySection({
         </div>
       </div>
 
-      {/* Embedded Player Preview */}
+      {/* Embedded Player Preview + Smart AI Music Player */}
       {previewGame && (
-        <div className="space-y-2">
-          <div className="flex items-center justify-between">
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-xs font-medium text-cyan-300">
               Executando no Player: {previewGame.name}
             </span>
-            <button
-              type="button"
-              onClick={() => setPreviewGameId(null)}
-              className="text-xs text-slate-400 hover:text-white"
-            >
-              Fechar player
-            </button>
+            <div className="flex items-center gap-3">
+              {onOpenWorkspace && (
+                <button
+                  type="button"
+                  onClick={() => onOpenWorkspace(previewGame, 'gifts')}
+                  className="text-xs text-purple-300 hover:text-white"
+                >
+                  Configurar presentes e músicas
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setPreviewGameId(null)}
+                className="text-xs text-slate-400 hover:text-white"
+              >
+                Fechar player
+              </button>
+            </div>
           </div>
           <GamePlayer
             gameId={previewGame.id}
             gameName={previewGame.name}
             bundleHtml={previewGame.bundleHtml}
             active={previewGame.isActive}
+          />
+          <SmartMusicPlayer
+            game={previewGame}
+            tracks={previewMusicTracks}
+            preferences={previewMusicPrefs}
+            adminRule={previewAdminRule}
+            variant="studio"
           />
         </div>
       )}
@@ -411,7 +473,7 @@ export function GamesLibrarySection({
                   </div>
                 </div>
 
-                <div className="px-5 py-3.5 border-t border-white/10 bg-[#0B0D14] flex flex-wrap items-center justify-between gap-2">
+                <div className="px-5 py-3.5 border-t border-white/10 bg-[#0B0D14] space-y-2.5">
                   <div className="flex flex-wrap items-center gap-2">
                     <button
                       type="button"
@@ -419,17 +481,28 @@ export function GamesLibrarySection({
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#3B82F6]/20 hover:bg-[#3B82F6]/30 text-blue-200 border border-[#3B82F6]/30 whitespace-nowrap"
                     >
                       <Play className="w-3.5 h-3.5" />
-                      Executar
+                      Abrir jogo
                     </button>
-                    <a
-                      href={`/overlay/${game.id}`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-white/5 hover:bg-white/10 text-slate-200 border border-white/10 whitespace-nowrap"
-                    >
-                      <ExternalLink className="w-3.5 h-3.5" />
-                      Overlay
-                    </a>
+                    {onOpenWorkspace ? (
+                      <button
+                        type="button"
+                        onClick={() => onOpenWorkspace(game, 'overlay')}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-white/5 hover:bg-white/10 text-slate-200 border border-white/10 whitespace-nowrap"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5 text-[#22D3EE]" />
+                        Gerar overlay
+                      </button>
+                    ) : (
+                      <a
+                        href={`/overlay/${game.id}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-white/5 hover:bg-white/10 text-slate-200 border border-white/10 whitespace-nowrap"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5" />
+                        Overlay
+                      </a>
+                    )}
                     {game.isActive && (
                       <button
                         type="button"
@@ -455,6 +528,43 @@ export function GamesLibrarySection({
                       </button>
                     )}
                   </div>
+
+                  {onOpenWorkspace && (
+                    <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-white/5">
+                      <button
+                        type="button"
+                        onClick={() => onOpenWorkspace(game, 'gifts')}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-[#11131C] hover:bg-white/10 text-slate-300 border border-white/10"
+                      >
+                        <Gift className="w-3 h-3 text-[#A78BFA]" />
+                        Presentes
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onOpenWorkspace(game, 'ai-radio')}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-[#11131C] hover:bg-white/10 text-slate-300 border border-white/10"
+                      >
+                        <Sliders className="w-3 h-3 text-[#22D3EE]" />
+                        Controles e ações
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onOpenWorkspace(game, 'personal-music')}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-[#11131C] hover:bg-white/10 text-slate-300 border border-white/10"
+                      >
+                        <Music className="w-3 h-3 text-emerald-300" />
+                        Músicas
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onOpenWorkspace(game, 'tiktok')}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-[#11131C] hover:bg-white/10 text-slate-300 border border-white/10"
+                      >
+                        <Radio className="w-3 h-3 text-pink-300" />
+                        Conectar TikTok
+                      </button>
+                    </div>
+                  )}
 
                   {isAdmin && (
                     <div className="flex items-center gap-1.5">

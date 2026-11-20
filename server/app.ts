@@ -1,4 +1,5 @@
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
+import { evaluateGiftMappings } from '../src/lib/giftActions.js';
 import { canCreateRule, PLANS } from '../src/lib/planLimits.js';
 import { evaluateRules } from '../src/lib/ruleEngine.js';
 import { isValidHexColor, validateRegistrationInput } from '../src/lib/validation.js';
@@ -6,11 +7,15 @@ import { buildIsolatedHtmlBundle, preparePlayableHtml } from '../src/lib/zipVali
 import type {
   GameCategory,
   GameEngine,
+  GiftActionKey,
   LiveEventPayload,
   LiveEventType,
+  MusicScope,
+  MusicSourceMode,
   OverlayConfig,
   PlanTier,
 } from '../src/types/platform.js';
+import { curateMusicOrderForGame } from './aiMusicCurator.js';
 import { prepareMercadoPagoCheckout } from './paymentAdapter.js';
 import {
   addUserSavedGame,
@@ -19,34 +24,62 @@ import {
   checkUserExists,
   countRulesForUser,
   createGameRecord,
+  createGiftMappingRecord,
+  createMusicPlaylistRecord,
+  createMusicSignedUploadUrl,
+  createMusicTrackRecord,
   createRuleRecord,
   deleteGameRecord,
+  deleteGiftMappingRecord,
+  deleteMusicPlaylistRecord,
+  deleteMusicTrackRecord,
   deleteRuleRecord,
   findGameById,
+  findMusicPlaylistById,
+  findMusicTrackById,
+  findOverlayIdsForUserAndGame,
   findUserByAccessToken,
   getAdminOverviewData,
+  getEffectiveAdminAiRule,
+  getGameMusicPreferencesRecord,
+  getOrCreateGameOverlayProfile,
   getPlatformSettings,
   getSubscriptionSummaryForUser,
+  listAdminAiMusicRules,
   listEventsForUser,
   listGamesForRole,
+  listGiftMappingsForUser,
+  listMusicPlaylistsVisible,
+  listMusicTracksVisible,
   listOverlayEventsSince,
   listRulesForUser,
+  listUserOverlayProfiles,
   loginUserWithSupabase,
   logoutSupabaseToken,
   recordLiveEvent,
+  regenerateGameOverlayProfileId,
   registerUserWithSupabase,
   removeUserSavedGame,
+  resolveOverlayTargetForEvents,
+  resolvePublicOverlayBundle,
   sanitizeUser,
   sendSupabasePasswordRecovery,
   type StoredUser,
   updateGameRecord,
+  updateGiftMappingRecord,
+  updateMusicPlaylistRecord,
+  updateMusicTrackRecord,
   updatePlatformSettings,
   updateRuleRecord,
   updateSupabaseUserPassword,
   updateUserProfileAndSettings,
+  upsertAdminAiMusicRule,
+  upsertGameMusicPreferencesRecord,
 } from './store.js';
 import {
   getMissingSupabaseEnvVars,
+  getSupabaseConfigIssues,
+  getSupabaseEnvConfig,
   isSupabaseConfigured,
   pingSupabase,
 } from './supabase.js';
@@ -158,6 +191,109 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
   const broadcastLiveEvent = hooks.broadcastLiveEvent || (() => {});
   const broadcastOverlayConfigUpdate = hooks.broadcastOverlayConfigUpdate || (() => {});
 
+  const processAndDispatchLiveEvent = async (input: {
+    userId: string;
+    gameId: string;
+    type: LiveEventType;
+    senderUsername: string;
+    giftName?: string;
+    giftCount?: number;
+    commentText?: string;
+    likeCount?: number;
+    points?: number;
+    bonusMultiplier?: number;
+    isSimulation: boolean;
+  }): Promise<LiveEventPayload> => {
+    const targetGameId = String(input.gameId || 'all');
+    const [userRules, giftMappings] = await Promise.all([
+      listRulesForUser(input.userId),
+      listGiftMappingsForUser(input.userId),
+    ]);
+
+    const ruleEval = evaluateRules(
+      {
+        gameId: targetGameId,
+        type: input.type,
+        senderUsername: input.senderUsername,
+        giftName: input.giftName,
+        giftCount: input.giftCount,
+        commentText: input.commentText,
+        likeCount: input.likeCount,
+        points: input.points,
+        bonusMultiplier: input.bonusMultiplier,
+      },
+      userRules,
+    );
+
+    const giftEval = evaluateGiftMappings(
+      {
+        gameId: targetGameId,
+        type: input.type,
+        senderUsername: input.senderUsername,
+        giftName: input.giftName,
+        giftCount: input.giftCount,
+      },
+      giftMappings,
+    );
+
+    const matchedRuleIds = Array.from(
+      new Set([...ruleEval.matchedRuleIds, ...giftEval.map((g) => g.ruleId)]),
+    );
+    const triggeredCommands = [...ruleEval.triggeredCommands, ...giftEval];
+
+    const eventRecord = await recordLiveEvent({
+      userId: input.userId,
+      gameId: targetGameId,
+      type: input.type,
+      senderUsername: input.senderUsername,
+      giftName: input.giftName,
+      giftCount: input.giftCount,
+      commentText: input.commentText,
+      likeCount: input.likeCount,
+      points: input.points,
+      bonusMultiplier: input.bonusMultiplier,
+      isSimulation: input.isSimulation,
+      matchedRuleIds,
+      triggeredCommands,
+    });
+
+    if (targetGameId === 'all') {
+      const [activeGames, userOverlays] = await Promise.all([
+        listGamesForRole(false),
+        findOverlayIdsForUserAndGame(input.userId, 'all'),
+      ]);
+      for (const g of activeGames) {
+        broadcastLiveEvent(input.userId, g.id, eventRecord);
+      }
+      for (const ovId of userOverlays) {
+        broadcastLiveEvent(input.userId, ovId, eventRecord);
+      }
+      broadcastLiveEvent(input.userId, 'all', eventRecord);
+    } else {
+      broadcastLiveEvent(input.userId, targetGameId, eventRecord);
+      const userOverlays = await findOverlayIdsForUserAndGame(input.userId, targetGameId);
+      for (const ovId of userOverlays) {
+        broadcastLiveEvent(input.userId, ovId, eventRecord);
+      }
+    }
+
+    return eventRecord;
+  };
+
+  tiktokProvider.setEventCallback(async (userId, incoming) => {
+    await processAndDispatchLiveEvent({
+      userId,
+      gameId: 'all',
+      type: incoming.type,
+      senderUsername: incoming.senderUsername,
+      giftName: incoming.giftName,
+      giftCount: incoming.giftCount,
+      commentText: incoming.commentText,
+      likeCount: incoming.likeCount,
+      isSimulation: false,
+    });
+  });
+
   app.use(express.json({ limit: '30mb' }));
 
   // Health endpoint (optionally checks live Supabase Auth + Postgres connectivity when ?check=db)
@@ -166,6 +302,8 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     asyncHandler(async (req, res) => {
       const configured = isSupabaseConfigured();
       const missingEnvVars = getMissingSupabaseEnvVars();
+      const configIssues = getSupabaseConfigIssues();
+      const envCfg = getSupabaseEnvConfig();
 
       if (req.query.check === 'db') {
         if (!configured) {
@@ -174,12 +312,35 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
             service: 'minha-live-games',
             database: 'unconfigured',
             missingEnvVars,
-            error: `Variáveis do Supabase não configuradas: ${missingEnvVars.join(', ')}.`,
+            configIssues,
+            error:
+              configIssues.join(' ') ||
+              `Variáveis do Supabase não configuradas: ${missingEnvVars.join(', ')}.`,
           });
           return;
         }
         try {
-          await pingSupabase();
+          const ping = await pingSupabase();
+          if (!ping.schemaReady) {
+            res.status(503).json({
+              ok: false,
+              service: 'minha-live-games',
+              runtime: process.env.VERCEL ? 'vercel-serverless' : 'node-server',
+              database: 'supabase-postgres',
+              auth: 'supabase-auth',
+              connected: true,
+              authConnected: ping.authConnected,
+              schemaReady: false,
+              migration001Ready: ping.migration001Ready,
+              migration002Ready: ping.migration002Ready,
+              storageBucketReady: ping.storageBucketReady,
+              missingTables: ping.missingTables,
+              keyModes: ping.keyModes,
+              error: `Conexão com Supabase Auth confirmada, porém faltam estruturas no PostgreSQL/Storage (${ping.missingTables.join(', ')}${ping.storageBucketReady ? '' : ', bucket mlg-music'}). Execute as migrations 001 e 002 no SQL Editor do Supabase.`,
+              timestamp: new Date().toISOString(),
+            });
+            return;
+          }
           res.json({
             ok: true,
             service: 'minha-live-games',
@@ -187,6 +348,12 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
             database: 'supabase-postgres',
             auth: 'supabase-auth',
             connected: true,
+            authConnected: ping.authConnected,
+            schemaReady: true,
+            migration001Ready: ping.migration001Ready,
+            migration002Ready: ping.migration002Ready,
+            storageBucketReady: ping.storageBucketReady,
+            keyModes: ping.keyModes,
             timestamp: new Date().toISOString(),
           });
           return;
@@ -196,6 +363,10 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
             service: 'minha-live-games',
             database: 'supabase-postgres',
             connected: false,
+            keyModes: {
+              publicKey: envCfg.publicKeyMode,
+              secretKey: envCfg.secretKeyMode,
+            },
             error:
               err instanceof Error
                 ? err.message
@@ -211,13 +382,18 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
         runtime: process.env.VERCEL ? 'vercel-serverless' : 'node-server',
         database: configured ? 'supabase-postgres' : 'unconfigured',
         auth: configured ? 'supabase-auth' : 'unconfigured',
+        keyModes: {
+          publicKey: envCfg.publicKeyMode,
+          secretKey: envCfg.secretKeyMode,
+        },
         missingEnvVars,
+        configIssues,
         timestamp: new Date().toISOString(),
       });
     }),
   );
 
-  // Guard auth/data API calls with clear 503 if Supabase env vars are missing
+  // Guard auth/data API calls with clear 503 if Supabase env vars are missing or invalid
   app.use('/api', (req: Request, res: Response, next: NextFunction) => {
     if (req.path === '/health') {
       next();
@@ -225,8 +401,11 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     }
     if (!isSupabaseConfigured()) {
       const missing = getMissingSupabaseEnvVars();
+      const issues = getSupabaseConfigIssues();
       res.status(503).json({
-        error: `Supabase não configurado. Defina as variáveis de ambiente: ${missing.join(', ')}.`,
+        error:
+          issues.join(' ') ||
+          `Supabase não configurado. Defina as variáveis de ambiente: ${missing.join(', ')}.`,
       });
       return;
     }
@@ -669,29 +848,35 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     }),
   );
 
-  // Public standalone Overlay endpoint (safe: never returns user PII) — PRESERVED UNCHANGED
+  // Public standalone Overlay endpoint (supports both legacy /overlay/gm_... and custom /overlay/ov_...)
   app.get(
     '/api/overlay/:id',
     asyncHandler(async (req, res) => {
-      const [game, settings] = await Promise.all([
-        findGameById(req.params.id),
-        getPlatformSettings(),
-      ]);
-      if (!game) {
+      const resolved = await resolvePublicOverlayBundle(req.params.id);
+      if (!resolved) {
         res.status(404).json({ error: 'Overlay não encontrado.' });
         return;
       }
       const origin = process.env.APP_URL?.trim() || `${req.protocol}://${req.get('host')}`;
-      const playableHtml = game.isActive ? preparePlayableHtml(game.bundleHtml, origin) : '';
+      const playableHtml = resolved.isActive
+        ? preparePlayableHtml(resolved.game.bundleHtml, origin)
+        : '';
+
       res.json({
         overlay: {
-          id: game.id,
-          name: game.name,
-          engine: game.engine,
-          isActive: game.isActive,
+          id: resolved.overlayId,
+          gameId: resolved.game.id,
+          name: resolved.game.name,
+          category: resolved.game.category,
+          engine: resolved.game.engine,
+          isActive: resolved.isActive,
           bundleHtml: playableHtml,
-          overlayConfig: game.overlayConfig,
-          watermarkText: settings.defaultWatermarkText || 'MINHA LIVE GAMES',
+          overlayConfig: resolved.overlayConfig,
+          controlsConfig: resolved.controlsConfig,
+          tiktokUsername: resolved.tiktokUsername,
+          watermarkText: resolved.watermarkText,
+          giftMappings: resolved.giftMappings,
+          music: resolved.music,
           capabilities: {
             websocket: !process.env.VERCEL,
             pollingIntervalMs: 1200,
@@ -701,12 +886,12 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     }),
   );
 
-  // Public Overlay real-time polling endpoint (Vercel Serverless fallback for WebSocket /ws) — PRESERVED UNCHANGED
+  // Public Overlay real-time polling endpoint (Vercel Serverless fallback for WebSocket /ws)
   app.get(
     '/api/overlay/:id/events',
     asyncHandler(async (req, res) => {
-      const game = await findGameById(req.params.id);
-      if (!game) {
+      const target = await resolveOverlayTargetForEvents(req.params.id);
+      if (!target) {
         res.status(404).json({ error: 'Overlay não encontrado.' });
         return;
       }
@@ -718,13 +903,13 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
           : Date.parse(rawSince)
         : 0;
 
-      const matching = await listOverlayEventsSince(game.id, sinceMs);
+      const matching = await listOverlayEventsSince(target.gameId, sinceMs, target.userId);
 
       res.setHeader('Cache-Control', 'no-store');
       res.json({
         events: matching,
-        isActive: game.isActive,
-        overlayConfig: game.overlayConfig,
+        isActive: target.isActive,
+        overlayConfig: target.overlayConfig,
         serverTime: new Date().toISOString(),
       });
     }),
@@ -859,26 +1044,9 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
         bonusMultiplier,
       } = req.body ?? {};
 
-      const targetGameId = String(gameId || 'all');
-      const userRules = await listRulesForUser(user.id);
-      const evaluation = evaluateRules(
-        {
-          gameId: targetGameId,
-          type: (type || 'gift') as LiveEventType,
-          senderUsername: String(senderUsername || 'espectador_teste').trim(),
-          giftName: giftName ? String(giftName) : undefined,
-          giftCount: giftCount !== undefined ? Number(giftCount) : undefined,
-          commentText: commentText ? String(commentText) : undefined,
-          likeCount: likeCount !== undefined ? Number(likeCount) : undefined,
-          points: points !== undefined ? Number(points) : undefined,
-          bonusMultiplier: bonusMultiplier !== undefined ? Number(bonusMultiplier) : undefined,
-        },
-        userRules,
-      );
-
-      const eventRecord = await recordLiveEvent({
+      const eventRecord = await processAndDispatchLiveEvent({
         userId: user.id,
-        gameId: targetGameId,
+        gameId: String(gameId || 'all'),
         type: (type || 'gift') as LiveEventType,
         senderUsername: String(senderUsername || 'espectador_teste').trim(),
         giftName: giftName ? String(giftName) : undefined,
@@ -888,19 +1056,7 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
         points: points !== undefined ? Number(points) : undefined,
         bonusMultiplier: bonusMultiplier !== undefined ? Number(bonusMultiplier) : undefined,
         isSimulation: true,
-        matchedRuleIds: evaluation.matchedRuleIds,
-        triggeredCommands: evaluation.triggeredCommands,
       });
-
-      if (targetGameId === 'all') {
-        const activeGames = await listGamesForRole(false);
-        for (const g of activeGames) {
-          broadcastLiveEvent(user.id, g.id, eventRecord);
-        }
-        broadcastLiveEvent(user.id, 'all', eventRecord);
-      } else {
-        broadcastLiveEvent(user.id, targetGameId, eventRecord);
-      }
 
       res.status(201).json({ event: eventRecord });
     }),
@@ -1023,6 +1179,572 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
     }),
   );
 
+  // ---------------------------------------------------------------------------
+  // Custom Gift Mappings (Per-User, Per-Game)
+  // ---------------------------------------------------------------------------
+  app.get(
+    '/api/gift-mappings',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const gameId = typeof req.query.gameId === 'string' ? req.query.gameId : undefined;
+      const mappings = await listGiftMappingsForUser(req.user!.id, gameId);
+      res.json({ mappings });
+    }),
+  );
+
+  app.post(
+    '/api/gift-mappings',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const body = req.body ?? {};
+      const gameId = String(body.gameId || '').trim();
+      const giftName = String(body.giftName || '').trim();
+      const actionKey = String(body.actionKey || 'move_walk') as GiftActionKey;
+
+      if (!gameId || gameId === 'all') {
+        res.status(400).json({ error: 'Selecione o jogo para vincular o presente.' });
+        return;
+      }
+      if (giftName.length < 2) {
+        res.status(400).json({ error: 'Informe o nome do presente do TikTok (ex.: Rosa, Coração).' });
+        return;
+      }
+
+      const mapping = await createGiftMappingRecord({
+        userId: req.user!.id,
+        gameId,
+        giftName,
+        minCount: body.minCount !== undefined ? Number(body.minCount) : 1,
+        actionKey,
+        actionLabel: typeof body.actionLabel === 'string' ? body.actionLabel : undefined,
+        actionCommand: typeof body.actionCommand === 'string' ? body.actionCommand : undefined,
+        actionPayload:
+          body.actionPayload && typeof body.actionPayload === 'object' ? body.actionPayload : undefined,
+        cooldownMs: body.cooldownMs !== undefined ? Number(body.cooldownMs) : 0,
+        enabled: body.enabled !== false,
+      });
+
+      res.status(201).json({ mapping });
+    }),
+  );
+
+  app.patch(
+    '/api/gift-mappings/:id',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const body = req.body ?? {};
+      const updated = await updateGiftMappingRecord(req.params.id, req.user!.id, {
+        ...(typeof body.giftName === 'string' ? { giftName: body.giftName } : {}),
+        ...(typeof body.minCount === 'number' ? { minCount: body.minCount } : {}),
+        ...(body.actionKey ? { actionKey: body.actionKey as GiftActionKey } : {}),
+        ...(typeof body.actionLabel === 'string' ? { actionLabel: body.actionLabel } : {}),
+        ...(typeof body.actionCommand === 'string' ? { actionCommand: body.actionCommand } : {}),
+        ...(body.actionPayload && typeof body.actionPayload === 'object'
+          ? { actionPayload: body.actionPayload }
+          : {}),
+        ...(typeof body.cooldownMs === 'number' ? { cooldownMs: body.cooldownMs } : {}),
+        ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+      });
+
+      if (!updated) {
+        res.status(404).json({ error: 'Configuração de presente não encontrada.' });
+        return;
+      }
+      res.json({ mapping: updated });
+    }),
+  );
+
+  app.delete(
+    '/api/gift-mappings/:id',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const removed = await deleteGiftMappingRecord(req.params.id, req.user!.id);
+      if (!removed) {
+        res.status(404).json({ error: 'Configuração de presente não encontrada.' });
+        return;
+      }
+      res.json({ ok: true });
+    }),
+  );
+
+  // ---------------------------------------------------------------------------
+  // Music Library (ADM Global Official + User Personal) & Smart AI Radio
+  // ---------------------------------------------------------------------------
+  app.post(
+    '/api/music/upload-url',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const body = req.body ?? {};
+      const requestedScope = (body.scope === 'official' ? 'official' : 'personal') as MusicScope;
+
+      if (requestedScope === 'official' && req.user!.role !== 'admin') {
+        res.status(403).json({
+          error: 'Somente administradores podem enviar músicas para a Biblioteca Oficial global.',
+        });
+        return;
+      }
+
+      const fileName = String(body.fileName || '').trim();
+      const mimeType = String(body.mimeType || 'audio/mpeg').trim();
+      const fileSizeBytes = Number(body.fileSizeBytes || 0);
+
+      if (!fileName) {
+        res.status(400).json({ error: 'Nome do arquivo de áudio obrigatório.' });
+        return;
+      }
+
+      const signed = await createMusicSignedUploadUrl({
+        userId: req.user!.id,
+        scope: requestedScope,
+        fileName,
+        mimeType,
+        fileSizeBytes,
+      });
+
+      res.json(signed);
+    }),
+  );
+
+  app.get(
+    '/api/music/tracks',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const gameId = typeof req.query.gameId === 'string' ? req.query.gameId : undefined;
+      const tracks = await listMusicTracksVisible({
+        userId: req.user!.id,
+        isAdmin: req.user!.role === 'admin',
+        gameId,
+      });
+      res.json({ tracks });
+    }),
+  );
+
+  app.post(
+    '/api/music/tracks',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const body = req.body ?? {};
+      const scope = (body.scope === 'official' ? 'official' : 'personal') as MusicScope;
+
+      if (scope === 'official' && req.user!.role !== 'admin') {
+        res.status(403).json({
+          error: 'Somente administradores podem cadastrar músicas oficiais na plataforma.',
+        });
+        return;
+      }
+
+      const storagePath = String(body.storagePath || '').trim();
+      const audioUrl = String(body.audioUrl || '').trim();
+      if (!storagePath || !audioUrl) {
+        res.status(400).json({ error: 'Envie o arquivo de áudio antes de salvar a faixa.' });
+        return;
+      }
+
+      // Enforce path prefix matches scope and user
+      if (scope === 'official' && !storagePath.startsWith('official/')) {
+        res.status(403).json({ error: 'Caminho de arquivo oficial inválido.' });
+        return;
+      }
+      if (scope === 'personal' && !storagePath.startsWith(`personal/${req.user!.id}/`)) {
+        res.status(403).json({ error: 'Caminho de arquivo pessoal inválido.' });
+        return;
+      }
+
+      const track = await createMusicTrackRecord({
+        scope,
+        ownerUserId: req.user!.id,
+        gameId: String(body.gameId || 'all'),
+        title: typeof body.title === 'string' ? body.title : undefined,
+        artist: typeof body.artist === 'string' ? body.artist : undefined,
+        genre: typeof body.genre === 'string' ? body.genre : undefined,
+        mood: typeof body.mood === 'string' ? body.mood : undefined,
+        bpm: typeof body.bpm === 'number' ? body.bpm : undefined,
+        durationSec: typeof body.durationSec === 'number' ? body.durationSec : undefined,
+        storagePath,
+        audioUrl,
+        mimeType: String(body.mimeType || 'audio/mpeg'),
+        fileSizeBytes: Number(body.fileSizeBytes || 0),
+        isActive: body.isActive !== false,
+        sortOrder: typeof body.sortOrder === 'number' ? body.sortOrder : 0,
+        aiTags: Array.isArray(body.aiTags) ? body.aiTags.map(String) : undefined,
+        originalFileName: typeof body.originalFileName === 'string' ? body.originalFileName : undefined,
+      });
+
+      res.status(201).json({ track });
+    }),
+  );
+
+  app.patch(
+    '/api/music/tracks/:id',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const existing = await findMusicTrackById(req.params.id);
+      if (!existing) {
+        res.status(404).json({ error: 'Faixa musical não encontrada.' });
+        return;
+      }
+
+      const isAdmin = req.user!.role === 'admin';
+      if (existing.scope === 'official' && !isAdmin) {
+        res.status(403).json({
+          error: 'Músicas oficiais globais só podem ser alteradas pelo administrador.',
+        });
+        return;
+      }
+      if (existing.scope === 'personal' && existing.ownerUserId !== req.user!.id && !isAdmin) {
+        res.status(403).json({ error: 'Você não tem permissão para alterar esta faixa.' });
+        return;
+      }
+
+      const body = req.body ?? {};
+      const updated = await updateMusicTrackRecord(existing.id, {
+        ...(typeof body.gameId === 'string' ? { gameId: body.gameId } : {}),
+        ...(typeof body.title === 'string' ? { title: body.title } : {}),
+        ...(typeof body.artist === 'string' ? { artist: body.artist } : {}),
+        ...(typeof body.genre === 'string' ? { genre: body.genre } : {}),
+        ...(typeof body.mood === 'string' ? { mood: body.mood } : {}),
+        ...(typeof body.bpm === 'number' ? { bpm: body.bpm } : {}),
+        ...(typeof body.durationSec === 'number' ? { durationSec: body.durationSec } : {}),
+        ...(typeof body.storagePath === 'string' ? { storagePath: body.storagePath } : {}),
+        ...(typeof body.audioUrl === 'string' ? { audioUrl: body.audioUrl } : {}),
+        ...(typeof body.mimeType === 'string' ? { mimeType: body.mimeType } : {}),
+        ...(typeof body.fileSizeBytes === 'number' ? { fileSizeBytes: body.fileSizeBytes } : {}),
+        ...(typeof body.isActive === 'boolean' ? { isActive: body.isActive } : {}),
+        ...(typeof body.sortOrder === 'number' ? { sortOrder: body.sortOrder } : {}),
+        ...(Array.isArray(body.aiTags) ? { aiTags: body.aiTags.map(String) } : {}),
+      });
+
+      res.json({ track: updated });
+    }),
+  );
+
+  app.delete(
+    '/api/music/tracks/:id',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const existing = await findMusicTrackById(req.params.id);
+      if (!existing) {
+        res.status(404).json({ error: 'Faixa musical não encontrada.' });
+        return;
+      }
+
+      const isAdmin = req.user!.role === 'admin';
+      if (existing.scope === 'official' && !isAdmin) {
+        res.status(403).json({
+          error: 'Usuários não podem excluir músicas da Biblioteca Oficial do administrador.',
+        });
+        return;
+      }
+      if (existing.scope === 'personal' && existing.ownerUserId !== req.user!.id && !isAdmin) {
+        res.status(403).json({ error: 'Você só pode excluir suas próprias músicas.' });
+        return;
+      }
+
+      await deleteMusicTrackRecord(existing.id);
+      res.json({ ok: true });
+    }),
+  );
+
+  app.get(
+    '/api/music/playlists',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const gameId = typeof req.query.gameId === 'string' ? req.query.gameId : undefined;
+      const playlists = await listMusicPlaylistsVisible({
+        userId: req.user!.id,
+        isAdmin: req.user!.role === 'admin',
+        gameId,
+      });
+      res.json({ playlists });
+    }),
+  );
+
+  app.post(
+    '/api/music/playlists',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const body = req.body ?? {};
+      const scope = (body.scope === 'official' ? 'official' : 'personal') as MusicScope;
+      if (scope === 'official' && req.user!.role !== 'admin') {
+        res.status(403).json({ error: 'Somente administradores criam playlists oficiais globais.' });
+        return;
+      }
+      const name = String(body.name || '').trim();
+      if (name.length < 2) {
+        res.status(400).json({ error: 'Informe um nome para a playlist (mínimo 2 caracteres).' });
+        return;
+      }
+
+      const playlist = await createMusicPlaylistRecord({
+        scope,
+        ownerUserId: req.user!.id,
+        gameId: String(body.gameId || 'all'),
+        name,
+        description: typeof body.description === 'string' ? body.description : '',
+        trackIds: Array.isArray(body.trackIds) ? body.trackIds.map(String) : [],
+        isActive: body.isActive !== false,
+      });
+      res.status(201).json({ playlist });
+    }),
+  );
+
+  app.patch(
+    '/api/music/playlists/:id',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const existing = await findMusicPlaylistById(req.params.id);
+      if (!existing) {
+        res.status(404).json({ error: 'Playlist não encontrada.' });
+        return;
+      }
+      const isAdmin = req.user!.role === 'admin';
+      if (existing.scope === 'official' && !isAdmin) {
+        res.status(403).json({ error: 'Playlists oficiais só podem ser editadas pelo administrador.' });
+        return;
+      }
+      if (existing.scope === 'personal' && existing.ownerUserId !== req.user!.id && !isAdmin) {
+        res.status(403).json({ error: 'Sem permissão para alterar esta playlist.' });
+        return;
+      }
+
+      const body = req.body ?? {};
+      const updated = await updateMusicPlaylistRecord(existing.id, {
+        ...(typeof body.name === 'string' ? { name: body.name } : {}),
+        ...(typeof body.description === 'string' ? { description: body.description } : {}),
+        ...(typeof body.gameId === 'string' ? { gameId: body.gameId } : {}),
+        ...(Array.isArray(body.trackIds) ? { trackIds: body.trackIds.map(String) } : {}),
+        ...(typeof body.isActive === 'boolean' ? { isActive: body.isActive } : {}),
+      });
+      res.json({ playlist: updated });
+    }),
+  );
+
+  app.delete(
+    '/api/music/playlists/:id',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const existing = await findMusicPlaylistById(req.params.id);
+      if (!existing) {
+        res.status(404).json({ error: 'Playlist não encontrada.' });
+        return;
+      }
+      const isAdmin = req.user!.role === 'admin';
+      if (existing.scope === 'official' && !isAdmin) {
+        res.status(403).json({ error: 'Playlists oficiais só podem ser removidas pelo administrador.' });
+        return;
+      }
+      if (existing.scope === 'personal' && existing.ownerUserId !== req.user!.id && !isAdmin) {
+        res.status(403).json({ error: 'Sem permissão para remover esta playlist.' });
+        return;
+      }
+      await deleteMusicPlaylistRecord(existing.id);
+      res.json({ ok: true });
+    }),
+  );
+
+  app.get(
+    '/api/music/preferences/:gameId',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const [preferences, adminRule] = await Promise.all([
+        getGameMusicPreferencesRecord(req.user!.id, req.params.gameId),
+        getEffectiveAdminAiRule(req.params.gameId),
+      ]);
+      res.json({ preferences, adminRule });
+    }),
+  );
+
+  app.put(
+    '/api/music/preferences/:gameId',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const body = req.body ?? {};
+      const validModes: MusicSourceMode[] = ['official_only', 'mixed', 'personal_only'];
+      const sourceMode = validModes.includes(body.sourceMode) ? body.sourceMode : undefined;
+
+      const preferences = await upsertGameMusicPreferencesRecord(
+        req.user!.id,
+        req.params.gameId,
+        {
+          ...(sourceMode ? { sourceMode } : {}),
+          ...(typeof body.autoplayEnabled === 'boolean'
+            ? { autoplayEnabled: body.autoplayEnabled }
+            : {}),
+          ...(typeof body.aiDjEnabled === 'boolean' ? { aiDjEnabled: body.aiDjEnabled } : {}),
+          ...(typeof body.crossfadeSeconds === 'number'
+            ? { crossfadeSeconds: body.crossfadeSeconds }
+            : {}),
+          ...(typeof body.volume === 'number' ? { volume: body.volume } : {}),
+          ...(typeof body.muted === 'boolean' ? { muted: body.muted } : {}),
+          ...(typeof body.preferredMood === 'string'
+            ? { preferredMood: body.preferredMood }
+            : {}),
+          ...(body.activePlaylistId === null || typeof body.activePlaylistId === 'string'
+            ? { activePlaylistId: body.activePlaylistId }
+            : {}),
+          ...(Array.isArray(body.aiCuratedOrder)
+            ? { aiCuratedOrder: body.aiCuratedOrder.map(String) }
+            : {}),
+        },
+      );
+      res.json({ preferences });
+    }),
+  );
+
+  app.post(
+    '/api/music/ai-curate/:gameId',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const game = await findGameById(req.params.gameId);
+      if (!game) {
+        res.status(404).json({ error: 'Jogo não encontrado para curadoria musical.' });
+        return;
+      }
+
+      const [tracks, preferences, adminRule] = await Promise.all([
+        listMusicTracksVisible({
+          userId: req.user!.id,
+          isAdmin: req.user!.role === 'admin',
+          gameId: game.id,
+        }),
+        getGameMusicPreferencesRecord(req.user!.id, game.id),
+        getEffectiveAdminAiRule(game.id),
+      ]);
+
+      const sourceMode = req.body?.sourceMode as MusicSourceMode | undefined;
+      const preferredMood =
+        typeof req.body?.preferredMood === 'string' ? req.body.preferredMood : undefined;
+
+      const curated = await curateMusicOrderForGame({
+        game,
+        tracks,
+        preferences,
+        adminRule,
+        sourceMode,
+        preferredMood,
+      });
+
+      const updatedPrefs = await upsertGameMusicPreferencesRecord(req.user!.id, game.id, {
+        ...(sourceMode ? { sourceMode } : {}),
+        ...(preferredMood ? { preferredMood } : {}),
+        aiCuratedOrder: curated.orderedTrackIds,
+      });
+
+      res.json({
+        curation: curated,
+        preferences: updatedPrefs,
+      });
+    }),
+  );
+
+  // Admin AI Global Music Rules
+  app.get(
+    '/api/admin/music/ai-rules',
+    requireAuth,
+    asyncHandler(async (_req, res) => {
+      const rules = await listAdminAiMusicRules();
+      res.json({ rules });
+    }),
+  );
+
+  app.put(
+    '/api/admin/music/ai-rules/:gameId',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const body = req.body ?? {};
+      const validModes: MusicSourceMode[] = ['official_only', 'mixed', 'personal_only'];
+      const defaultSourceMode = validModes.includes(body.defaultSourceMode)
+        ? body.defaultSourceMode
+        : undefined;
+
+      const rule = await upsertAdminAiMusicRule(req.params.gameId || 'all', {
+        ...(defaultSourceMode ? { defaultSourceMode } : {}),
+        ...(typeof body.prioritizeOfficialRatio === 'number'
+          ? { prioritizeOfficialRatio: body.prioritizeOfficialRatio }
+          : {}),
+        ...(typeof body.avoidRepeatWindow === 'number'
+          ? { avoidRepeatWindow: body.avoidRepeatWindow }
+          : {}),
+        ...(typeof body.crossfadeSeconds === 'number'
+          ? { crossfadeSeconds: body.crossfadeSeconds }
+          : {}),
+        ...(typeof body.preferredEnergy === 'string'
+          ? { preferredEnergy: body.preferredEnergy }
+          : {}),
+        ...(typeof body.aiInstructions === 'string'
+          ? { aiInstructions: body.aiInstructions }
+          : {}),
+      });
+      res.json({ rule });
+    }),
+  );
+
+  // ---------------------------------------------------------------------------
+  // Custom Per-User, Per-Game Overlay Links (/overlay/ov_...) & Controls
+  // ---------------------------------------------------------------------------
+  app.get(
+    '/api/overlays/profiles',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const profiles = await listUserOverlayProfiles(req.user!.id);
+      res.json({ profiles });
+    }),
+  );
+
+  app.get(
+    '/api/overlays/profile/:gameId',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const profile = await getOrCreateGameOverlayProfile(req.user!.id, req.params.gameId);
+      if (!profile) {
+        res.status(404).json({ error: 'Jogo não encontrado para gerar overlay.' });
+        return;
+      }
+      res.json({ profile });
+    }),
+  );
+
+  app.put(
+    '/api/overlays/profile/:gameId',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const body = req.body ?? {};
+      const profile = await getOrCreateGameOverlayProfile(req.user!.id, req.params.gameId, {
+        ...(typeof body.label === 'string' ? { label: body.label } : {}),
+        ...(typeof body.tiktokUsername === 'string' ? { tiktokUsername: body.tiktokUsername } : {}),
+        ...(body.controlsConfig && typeof body.controlsConfig === 'object'
+          ? { controlsConfig: body.controlsConfig }
+          : {}),
+        ...(body.overlayConfig && typeof body.overlayConfig === 'object'
+          ? { overlayConfig: body.overlayConfig }
+          : {}),
+        ...(typeof body.isActive === 'boolean' ? { isActive: body.isActive } : {}),
+      });
+
+      if (!profile) {
+        res.status(404).json({ error: 'Jogo não encontrado para atualizar overlay.' });
+        return;
+      }
+
+      broadcastOverlayConfigUpdate(profile.id, profile.overlayConfig);
+      res.json({ profile });
+    }),
+  );
+
+  app.post(
+    '/api/overlays/profile/:gameId/regenerate',
+    requireAuth,
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+      const profile = await regenerateGameOverlayProfileId(req.user!.id, req.params.gameId);
+      if (!profile) {
+        res.status(404).json({ error: 'Jogo não encontrado para regenerar link.' });
+        return;
+      }
+      res.json({ profile });
+    }),
+  );
+
   // JSON 404 handler for unmatched API routes
   app.use('/api', (_req: Request, res: Response) => {
     res.status(404).json({ error: 'Endpoint da API não encontrado.' });
@@ -1032,6 +1754,22 @@ export function registerApiRoutes(app: Express, hooks: BroadcastHooks = {}): voi
   app.use('/api', (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     console.error('Erro na API MINHA LIVE GAMES:', err);
     if (!res.headersSent) {
+      const msg = err instanceof Error ? err.message : '';
+      const causeMsg =
+        err instanceof Error && err.cause instanceof Error ? err.cause.message : '';
+      const combined = `${msg} ${causeMsg}`;
+      if (
+        combined.includes('PGRST205') ||
+        combined.includes('Could not find the table') ||
+        combined.includes('schema cache') ||
+        combined.includes('does not exist')
+      ) {
+        res.status(503).json({
+          error:
+            'Supabase conectado, mas as tabelas SQL ainda não foram criadas. Execute os scripts 001_minha_live_games_supabase.sql e 002_interactive_music_gifts_overlays.sql no SQL Editor do Supabase.',
+        });
+        return;
+      }
       res.status(500).json({ error: 'Erro interno ao processar a solicitação.' });
     }
   });
